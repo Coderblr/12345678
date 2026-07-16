@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+CI/CD client for the Txn Automation Console.
+
+Usage (from a pipeline step, orchestrator API already running):
+  python tools/ci_run.py --txn 1010
+  python tools/ci_run.py --feature path/to/Txn009093.feature --ai
+  python tools/ci_run.py --brd path/to/requirements.docx
+  python tools/ci_run.py --feature f.feature --ai --api http://ci-agent:8000
+
+Exit codes (for pipeline gating):
+  0 = run passed
+  1 = run failed (test failures)          -> fail the build
+  2 = paused for human review              -> mark build "review required"
+       (happens under AUTO_APPROVE_POLICY=never, or =no_todos when the AI
+        generated TODO locator markers it could not resolve)
+  3 = error (infra/config/AI failure)      -> fail the build, check logs
+
+The full HTML-ready report JSON is written next to this script as
+ci_report_<job_id>.json for archiving as a build artifact.
+"""
+import argparse
+import json
+import pathlib
+import sys
+import time
+import urllib.request
+
+
+def _post(url, data=None, files=None):
+    if files:
+        import mimetypes
+        import uuid
+        boundary = uuid.uuid4().hex
+        name, path = files
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                f"filename=\"{pathlib.Path(path).name}\"\r\nContent-Type: "
+                f"{mimetypes.guess_type(path)[0] or 'application/octet-stream'}\r\n\r\n"
+                ).encode() + pathlib.Path(path).read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    else:
+        req = urllib.request.Request(url, data=json.dumps(data or {}).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read())
+
+
+def _get(url):
+    with urllib.request.urlopen(url, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--api", default="http://127.0.0.1:8000")
+    ap.add_argument("--txn", help="run by transaction number")
+    ap.add_argument("--feature", help="path to a .feature file to upload")
+    ap.add_argument("--brd", help="path to a BRD (.pdf/.docx/.txt)")
+    ap.add_argument("--ai", action="store_true", help="Framework Intelligence mode for --feature")
+    ap.add_argument("--timeout-min", type=int, default=60)
+    args = ap.parse_args()
+
+    if args.txn:
+        job = _post(f"{args.api}/execute/txn/{args.txn if args.txn.lower().startswith('txn') else 'Txn' + args.txn}")
+    elif args.brd:
+        job = _post(f"{args.api}/execute/brd", files=("file", args.brd))
+    elif args.feature:
+        job = _post(f"{args.api}/execute/upload?ai={'true' if args.ai else 'false'}&dry_run=false",
+                    files=("file", args.feature))
+    else:
+        print("ERROR: one of --txn / --feature / --brd is required"); return 3
+
+    job_id = job["job_id"]
+    print(f"[ci] job {job_id} started")
+    deadline = time.time() + args.timeout_min * 60
+    last = ""
+    while time.time() < deadline:
+        j = _get(f"{args.api}/jobs/{job_id}")
+        if j["status"] != last:
+            print(f"[ci] status: {j['status']}")
+            last = j["status"]
+        if j["status"] in ("passed", "failed", "error", "review", "discarded"):
+            pathlib.Path(f"ci_report_{job_id}.json").write_text(json.dumps(j, indent=1))
+            s = j.get("summary", {})
+            print(f"[ci] scenarios: {s.get('scenarios_total', '?')} "
+                  f"passed: {s.get('scenarios_passed', '?')} failed: {s.get('scenarios_failed', '?')}")
+            if j["status"] == "passed":
+                return 0
+            if j["status"] == "review":
+                print("[ci] REVIEW REQUIRED — AI changes contain unresolved locators; "
+                      "a human must approve in the console before this can run.")
+                return 2
+            if j["status"] == "failed":
+                return 1
+            print(f"[ci] error: {s.get('error', 'unknown')}")
+            return 3
+        time.sleep(5)
+    print("[ci] TIMEOUT waiting for job"); return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
