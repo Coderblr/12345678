@@ -564,7 +564,23 @@ def _run(job: Job, dry_run: bool, run_params: dict | None, tag_filter: str | Non
             job.feature_path = run_now
             _execute(job, "a")
         else:
-            job.status = "review"          # frontend shows the editor; approval resumes
+            policy = getattr(config, "AUTO_APPROVE_POLICY", "never")
+            pending_blob = (job.pending.get("feature_text", "") +
+                            "".join(job.pending.get("files", {}).values()))
+            has_todos = "TODO QA" in pending_blob or "TODO:" in pending_blob
+            if policy == "always" or (policy == "no_todos" and not has_todos):
+                _log_error  # noqa: B018 — keep symbol referenced for clarity
+                with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"\n>>> AUTO-APPROVE (policy: {policy}"
+                            f"{', no TODO markers found' if policy == 'no_todos' else ''}) — "
+                            "committing without human review (CI mode)...\n")
+                _finalize(job)
+            else:
+                if policy == "no_todos" and has_todos:
+                    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                        f.write("\n>>> AUTO-APPROVE withheld: generated code contains TODO locator "
+                                "markers — pausing for human review (policy: no_todos).\n")
+                job.status = "review"          # frontend shows the editor; approval resumes
     except Exception as e:  # noqa: BLE001
         job.status = "error"
         job.summary = {"error": str(e)}
