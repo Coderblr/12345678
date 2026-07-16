@@ -133,6 +133,15 @@ AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "PASTE-YOUR-KEY")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")  # your deployment NAME
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
+# CI/CD: automatic approval policy for AI-generated framework changes.
+#   "never"    - always pause for human review (default; interactive use)
+#   "no_todos" - auto-commit ONLY when generated code has zero TODO-locator
+#                markers (every locator resolved from real knowledge); anything
+#                uncertain still pauses -> CI marks the build "review required"
+#   "always"   - auto-commit everything that compiles (full zero-touch; use
+#                only once the locator repository has good coverage)
+AUTO_APPROVE_POLICY = os.getenv("AUTO_APPROVE_POLICY", "never")
+
 # Locator Recorder: path to msedgedriver.exe (the framework bundles one) and
 # the URL the recording browser opens on (empty = user types it in the UI).
 EDGE_DRIVER_PATH = os.getenv("EDGE_DRIVER_PATH",
