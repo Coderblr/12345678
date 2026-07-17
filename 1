@@ -1,856 +1,109 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Txn Automation Console</title>
-<style>
-  :root{
-    --bg:#eef2f9; --card:#ffffff; --ink:#101a2e; --muted:#64748b; --line:#e2e8f2;
-    --a1:#4f46e5; --a2:#0ea5e9; --grad:linear-gradient(135deg,#4f46e5 0%,#0ea5e9 100%);
-    --pass:#16a34a; --pass-soft:#e7f6ec; --fail:#dc2626; --fail-soft:#fdecec;
-    --warn:#b45309; --warn-soft:#fef3d8;
-    --console:#0b1220; --console-ink:#cfe0f4;
-    --mono:"Consolas","Cascadia Mono",monospace; --sans:"Segoe UI",system-ui,Arial,sans-serif;
-    --shadow:0 10px 30px rgba(16,26,46,.08), 0 2px 6px rgba(16,26,46,.05);
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:
-       radial-gradient(1200px 400px at 80% -100px, rgba(79,70,229,.10), transparent 60%),
-       radial-gradient(900px 380px at 10% -80px, rgba(14,165,233,.10), transparent 60%),
-       var(--bg);
-       color:var(--ink);font-family:var(--sans);min-height:100vh;font-size:15px}
-  /* ── header ── */
-  header{display:flex;align-items:center;gap:16px;padding:16px 28px}
-  .logo{width:38px;height:38px;border-radius:11px;background:var(--grad);display:grid;place-items:center;
-        color:#fff;font-weight:800;font-size:16px;box-shadow:0 6px 16px rgba(79,70,229,.35)}
-  header h1{font-size:18px;margin:0;letter-spacing:.2px}
-  header .sub{font-size:12px;color:var(--muted)}
-  .spacer{flex:1}
-  .btn{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
-       padding:9px 16px;border-radius:10px;cursor:pointer;transition:.15s;box-shadow:0 1px 2px rgba(16,26,46,.05)}
-  .btn:hover{border-color:var(--a1);transform:translateY(-1px)}
-  .btn:focus-visible{outline:2px solid var(--a1);outline-offset:2px}
-  .btn.primary{background:var(--grad);border:0;color:#fff;font-weight:700;letter-spacing:.3px;
-               box-shadow:0 8px 20px rgba(79,70,229,.35)}
-  .btn.primary:disabled{opacity:.55;cursor:not-allowed;transform:none}
-  .btn.stop{background:linear-gradient(135deg,#ef4444,#b91c1c);border:0;color:#fff;font-weight:700;
-            box-shadow:0 8px 20px rgba(220,38,38,.30);display:none}
-  /* ── layout per sketch: [new execution | execution] then reports full width ── */
-  main{display:grid;grid-template-columns:400px 1fr;gap:20px;padding:6px 28px 28px;max-width:1600px;margin:0 auto}
-  #reportcard{grid-column:1 / -1}
-  @media(max-width:1020px){main{grid-template-columns:1fr}}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:var(--shadow)}
-  .card h2{display:flex;align-items:center;gap:8px;font-size:13.5px;text-transform:uppercase;
-           letter-spacing:1.2px;color:var(--muted);margin:0 0 16px;font-weight:700}
-  .card h2::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--grad)}
-  /* tabs — Upload first & default */
-  .tabs{display:flex;background:#f1f4fa;border-radius:12px;padding:4px;margin-bottom:18px}
-  .tabs button{flex:1;font:inherit;font-weight:600;padding:10px;border:0;border-radius:9px;
-               background:transparent;color:var(--muted);cursor:pointer;transition:.15s}
-  .tabs button.active{background:#fff;color:var(--a1);box-shadow:0 2px 8px rgba(16,26,46,.10)}
-  label{display:block;font-size:13px;color:var(--muted);margin:12px 0 6px;font-weight:600}
-  input[type=file]{width:100%;font:inherit;padding:10px;border:1.5px dashed var(--line);border-radius:10px;background:#fafbfe}
-  .check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted)}
-  .hintbox{font-size:13px;color:var(--muted);background:#f6f8fd;border:1px solid var(--line);
-           border-radius:10px;padding:10px 12px;margin-top:12px;line-height:1.5}
-  .hintbox.ai{background:#f6f0ff;border-color:#e4d4fb;color:#5b21b6}
-  .tabs button#tab-ai.active{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff}
-  .mono{font-family:var(--mono)}
-  /* ── Txn combo: fixed label + searchable scrollable dropdown ── */
-  .combo{position:relative}
-  .combo .row{display:flex;border:1.5px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;transition:.15s}
-  .combo .row:focus-within{border-color:var(--a1);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-  .chip{background:var(--grad);color:#fff;font-weight:700;padding:11px 16px;font-size:14px;letter-spacing:.5px}
-  .combo input{flex:1;border:0;outline:0;font:inherit;padding:11px 12px;font-family:var(--mono)}
-  .ddl{position:absolute;z-index:30;top:calc(100% + 6px);left:0;right:0;background:#fff;
-       border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
-       max-height:280px;overflow-y:auto;display:none}
-  .ddl.open{display:block}
-  .ddl .item{padding:10px 14px;cursor:pointer;display:flex;gap:10px;align-items:baseline;border-bottom:1px solid #f3f5fa}
-  .ddl .item:hover,.ddl .item.hl{background:#f4f6ff}
-  .ddl .num{font-family:var(--mono);font-weight:700;color:var(--a1);min-width:74px}
-  .ddl .fname{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-  .ddl .mod{font-size:10px;font-weight:700;text-transform:uppercase;color:#fff;background:#94a3b8;
-            border-radius:20px;padding:2px 8px;letter-spacing:.5px}
-  .ddl .empty{padding:14px;color:var(--muted);font-size:13px;text-align:center}
-  /* ── execution panel ── */
-  .rail{display:flex;margin:4px 0 16px}
-  .stage{flex:1;text-align:center;font-size:12px;color:var(--muted);position:relative;padding-top:20px}
-  .stage::before{content:"";width:13px;height:13px;border-radius:50%;background:#d3dced;
-                 position:absolute;top:0;left:50%;transform:translateX(-50%);transition:.25s}
-  .stage::after{content:"";position:absolute;top:6px;left:-50%;width:100%;height:2.5px;background:#d3dced;z-index:0;transition:.25s}
-  .stage:first-child::after{display:none}
-  .stage.on::before{background:var(--a1);box-shadow:0 0 0 4px rgba(79,70,229,.18)}
-  .stage.on::after{background:var(--a1)}
-  .stage.done::before{background:var(--pass)} .stage.done::after{background:var(--pass)}
-  .stage.bad::before{background:var(--fail)}
-  .badge{font-size:13px;font-weight:700;padding:4px 12px;border-radius:20px;text-transform:capitalize}
-  .badge.idle,.badge.queued{background:#eef1f7;color:var(--muted)}
-  .badge.running{background:#e6efff;color:var(--a1);animation:pulse 1.4s infinite}
-  .badge.passed{background:var(--pass-soft);color:var(--pass)}
-  .badge.failed,.badge.error{background:var(--fail-soft);color:var(--fail)}
-  .badge.stopped,.badge.discarded{background:var(--warn-soft);color:var(--warn)}
-  .badge.review{background:#f3e8ff;color:#7c3aed;animation:pulse 1.4s infinite}
-  /* review editor */
-  .rfile{margin:16px 0}
-  .rfile .fhead{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:13px;
-                font-weight:700;color:var(--a1);margin-bottom:6px}
-  .rfile .ftag{font-size:10px;font-weight:800;letter-spacing:.6px;color:#fff;background:var(--grad);
-               border-radius:20px;padding:2px 10px;text-transform:uppercase}
-  textarea.code{width:100%;min-height:230px;resize:vertical;font-family:var(--mono);font-size:13px;
-                line-height:1.55;color:var(--console-ink);background:var(--console);border:1px solid #223049;
-                border-radius:12px;padding:14px;box-shadow:inset 0 2px 10px rgba(0,0,0,.4);tab-size:4}
-  textarea.code:focus-visible{outline:2px solid var(--a1)}
-  .diffview{width:100%;font-family:var(--mono);font-size:12.5px;line-height:1.6;color:var(--console-ink);
-            background:var(--console);border:1px solid #223049;border-radius:12px;padding:10px 0;
-            box-shadow:inset 0 2px 10px rgba(0,0,0,.4);max-height:420px;overflow-y:auto}
-  .diffview .dline{padding:1px 14px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent}
-  .diffview .dline.added{background:rgba(34,197,94,.16);border-left-color:#22c55e;color:#c9f7d9}
-  .diffview .dline.added::before{content:"+ ";color:#4ade80;font-weight:700}
-  .diffview .dline.removed{background:rgba(239,68,68,.14);border-left-color:#ef4444;color:#f8b4b4;
-                           text-decoration:line-through;text-decoration-color:rgba(248,180,180,.5)}
-  .diffview .dline.removed::before{content:"- ";color:#f87171;font-weight:700}
-  .diffview .dline.same{color:#8391a8}
-  .diffview .dline.same::before{content:"  "}
-  .diffsummary{font-size:11.5px;color:var(--muted);margin:4px 0 8px;display:flex;gap:14px;align-items:center}
-  .diffsummary b.added{color:var(--pass)} .diffsummary b.removed{color:var(--fail)}
-  .edittoggle{font-size:11.5px;font-weight:700;padding:3px 12px;border-radius:20px;border:1px solid var(--line);
-             background:#fff;color:var(--muted);cursor:pointer;margin-left:auto}
-  .edittoggle:hover{border-color:var(--a1);color:var(--a1)}
-  .rmeta{font-size:13.5px;background:#f3f0ff;border:1px solid #e4dcfb;color:#5b21b6;
-         border-radius:10px;padding:10px 14px;margin-bottom:6px}
-  .matchbar{display:flex;align-items:center;gap:10px;font-size:13.5px;background:#eef6ff;
-            border:1px solid #d3e6fb;color:#1e40af;border-radius:10px;padding:10px 14px;margin-bottom:14px}
-  .matchbar.newfeat{background:#fff8e6;border-color:#fbe4b0;color:#92600a}
-  .compare-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
-  .ccard{border-radius:10px;padding:10px 12px;text-align:center;border:1px solid var(--line)}
-  .ccard b{display:block;font-size:22px} .ccard span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  .ccard.unchanged{background:#f4f6fb} .ccard.new{background:var(--pass-soft)}
-  .ccard.kept{background:#fff8e6} .ccard.modified{background:#eef2ff}
-  .ai-decisions{font-size:12.5px;background:#fafbff;border:1px solid var(--line);border-radius:10px;
-                padding:10px 14px;margin-bottom:16px;max-height:160px;overflow-y:auto}
-  .ai-decisions .row{padding:3px 0;border-bottom:1px dashed #eef1f7;display:flex;gap:8px;align-items:baseline}
-  .ai-decisions .row:last-child{border-bottom:0}
-  .ai-decisions .tag{font-size:10px;font-weight:800;text-transform:uppercase;color:#fff;
-                     background:#7c3aed;border-radius:12px;padding:1px 8px;flex-shrink:0}
-  .ai-decisions code{font-family:var(--mono);font-size:11.5px}
-  .compilebadge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;
-                padding:5px 12px;border-radius:20px;background:var(--pass-soft);color:var(--pass);margin-bottom:14px}
-  @keyframes pulse{50%{opacity:.55}}
-  #console{background:var(--console);color:var(--console-ink);font-family:var(--mono);font-size:13px;
-           line-height:1.6;border-radius:12px;padding:14px 16px;height:300px;overflow:auto;
-           white-space:pre-wrap;word-break:break-word;box-shadow:inset 0 2px 12px rgba(0,0,0,.45)}
-  #console:empty::before{content:"Console output will stream here once a run starts.";color:#5b6b85}
-  /* ── reports ── */
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
-  .kpi{border:1px solid var(--line);border-radius:14px;padding:16px 18px;background:linear-gradient(180deg,#fff, #fafbff)}
-  .kpi b{display:block;font-size:36px;line-height:1.1;font-variant-numeric:tabular-nums}
-  .kpi span{font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
-  .kpi.p b{color:var(--pass)} .kpi.f b{color:var(--fail)} .kpi.a b{background:var(--grad);
-    -webkit-background-clip:text;background-clip:text;color:transparent}
-  .charts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:26px;align-items:start}
-  .cols{display:flex;justify-content:center;align-items:flex-end;gap:44px;height:210px;padding-top:10px}
-  .col{display:flex;flex-direction:column;align-items:center;gap:8px}
-  .col .val{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums}
-  .col .bar{width:64px;border-radius:10px 10px 4px 4px;transition:height .7s ease;box-shadow:inset 0 -3px 8px rgba(0,0,0,.12)}
-  .col .lab{font-size:13px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
-  @media(max-width:1100px){.charts{grid-template-columns:1fr}}
-  .chart-title{font-size:14px;color:var(--muted);font-weight:700;text-transform:uppercase;
-               letter-spacing:.8px;margin-bottom:12px;text-align:center}
-  .legend{font-size:13.5px;color:var(--muted);display:flex;gap:16px;justify-content:center;margin-top:10px}
-  .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
-  .barrow{display:grid;grid-template-columns:minmax(120px,260px) 1fr 58px;gap:12px;align-items:center;font-size:12px;margin:8px 0}
-  .barrow .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155}
-  .bartrack{background:#eef1f8;border-radius:6px;height:16px;overflow:hidden}
-  .barfill{height:100%;border-radius:6px;min-width:5px;transition:width .6s ease}
-  .stack{height:26px;border-radius:8px;overflow:hidden;display:flex;box-shadow:inset 0 1px 3px rgba(0,0,0,.08)}
-  .stack div{transition:width .6s ease}
-  .note{border-radius:10px;padding:10px 14px;font-size:13px;margin-top:18px;background:var(--warn-soft);color:var(--warn);display:none}
-  #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;
-         padding:11px 20px;border-radius:12px;font-size:13px;display:none;z-index:99;box-shadow:var(--shadow)}
-</style>
-</head>
-<body>
-<header>
-  <div class="logo">Tx</div>
-  <div>
-    <h1>Txn Automation Console</h1>
-    <div class="sub">NBC Cucumber framework &middot; executes via TestRunner on Microsoft Edge</div>
-  </div>
-  <div class="spacer"></div>
-  <span id="idxinfo" class="sub"></span>
-  <button class="btn" onclick="rebuildIndex()">&#8635; Rebuild index</button>
-</header>
+#!/usr/bin/env python3
+"""
+CI/CD client for the Txn Automation Console.
 
-<main>
-  <!-- ═════════ NEW EXECUTION (sketch: top-left) ═════════ -->
-  <section class="card">
-    <h2>New Execution</h2>
-    <div class="tabs">
-      <button id="tab-up" class="active" onclick="setTab('up')">Upload Feature</button>
-      <button id="tab-ai" onclick="setTab('ai')">+ Framework Intelligence (Feature / BRD)</button>
-      <button id="tab-txn" onclick="setTab('txn')">Run by Txn No</button>
-    </div>
+Usage (from a pipeline step, orchestrator API already running):
+  python tools/ci_run.py --txn 1010
+  python tools/ci_run.py --feature path/to/Txn009093.feature --ai
+  python tools/ci_run.py --brd path/to/requirements.docx
+  python tools/ci_run.py --feature f.feature --ai --api http://ci-agent:8000
 
-    <div id="pane-up">
-      <label for="file">Feature file (.feature)</label>
-      <input id="file" type="file" accept=".feature">
-      <label class="check"><input id="dry" type="checkbox" checked>
-        Verify steps first (dry run &mdash; no browser, seconds)</label>
-      <label class="check"><input id="capup" type="checkbox">
-        <b>Capture Mode</b>&nbsp;&mdash; save screenshot + HTML at every step (feeds locator repository &amp; self-healing)</label>
-      <div class="hintbox">Runs from the server's uploads folder as-is — the framework source is never modified.</div>
-    </div>
+Exit codes (for pipeline gating):
+  0 = run passed
+  1 = run failed (test failures)          -> fail the build
+  2 = paused for human review              -> mark build "review required"
+       (happens under AUTO_APPROVE_POLICY=never, or =no_todos when the AI
+        generated TODO locator markers it could not resolve)
+  3 = error (infra/config/AI failure)      -> fail the build, check logs
 
-    <div id="pane-ai" style="display:none">
-      <label for="fileai"><b>Upload a Feature file or a BRD</b> &nbsp;<span style="color:var(--muted);font-weight:400">(.feature, .pdf, .docx, .txt)</span></label>
-      <input id="fileai" type="file" accept=".feature,.pdf,.docx,.txt">
-      <div class="sub" style="text-transform:none;letter-spacing:0;color:var(--muted);font-size:12px;margin-top:4px">
-        <b>.feature</b> &rarr; used directly &nbsp;&middot;&nbsp; <b>.pdf / .docx / .txt (BRD)</b> &rarr; AI drafts the feature first, in your framework's wording</div>
-      <div class="hintbox ai">
-        <b>Framework Intelligence</b> accepts a ready feature file <i>or a BRD document</i>
-        (AI drafts the feature from the BRD first, using your framework's own step wording). It will:
-        find the closest matching existing feature (even
-        without a transaction number) &middot; normalize your wording to framework conventions
-        &middot; merge non-destructively &middot; generate only the missing Java, reusing
-        existing steps/locators &middot; compile-verify &middot; then <b>pause for your review
-        and approval</b> before anything touches the framework.
-      </div>
-    </div>
+The full HTML-ready report JSON is written next to this script as
+ci_report_<job_id>.json for archiving as a build artifact.
+"""
+import argparse
+import json
+import pathlib
+import sys
+import time
+import urllib.request
 
-    <div id="pane-txn" style="display:none">
-      <label>Transaction number</label>
-      <div class="combo" id="combo">
-        <div class="row">
-          <span class="chip">Txn</span>
-          <input id="txn" placeholder="type a number or click to browse&hellip;" autocomplete="off"
-                 oninput="filterDdl()" onfocus="openDdl()">
-        </div>
-      <label class="check" style="margin-top:10px"><input id="captxn" type="checkbox">
-        <b>Capture Mode</b>&nbsp;&mdash; save screenshot + HTML at every step</label>
-        <div class="ddl" id="ddl"></div>
-      </div>
-      <div class="hintbox">All <b id="featcount">&hellip;</b> feature files are listed — scroll or type to search.
-        The backend verifies the matching tag exists inside the feature before launching.</div>
-    </div>
 
-    <button id="runbtn" class="btn primary" style="width:100%;margin-top:18px;padding:13px" onclick="run()">&#9654;&nbsp; Run on Edge</button>
-    <button id="stopbtn" class="btn stop" style="width:100%;margin-top:10px;padding:13px" onclick="stopRun()">&#9632;&nbsp; Stop execution</button>
-  </section>
+def _post(url, data=None, files=None):
+    if files:
+        import mimetypes
+        import uuid
+        boundary = uuid.uuid4().hex
+        name, path = files
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                f"filename=\"{pathlib.Path(path).name}\"\r\nContent-Type: "
+                f"{mimetypes.guess_type(path)[0] or 'application/octet-stream'}\r\n\r\n"
+                ).encode() + pathlib.Path(path).read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    else:
+        req = urllib.request.Request(url, data=json.dumps(data or {}).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read())
 
-  <!-- ═════════ EXECUTION (sketch: top-right) ═════════ -->
-  <section class="card">
-    <h2>Execution <span id="jobmeta" class="sub" style="text-transform:none;letter-spacing:0"></span>
-        <span class="spacer"></span><span id="status" class="badge idle">idle</span></h2>
-    <div class="rail">
-      <div class="stage" id="s1">Lookup</div>
-      <div class="stage" id="s2">Launch JVM</div>
-      <div class="stage" id="s3">Edge run</div>
-      <div class="stage" id="s4">Report</div>
-    </div>
-    <div id="console" role="log" aria-live="polite"></div>
-  </section>
 
-  <!-- ═════════ LOCATOR RECORDER (human workflow -> real locators) ═════════ -->
-  <section class="card" style="grid-column:1 / -1">
-    <h2>Locator Recorder <span class="sub" style="text-transform:none;letter-spacing:0">
-      &mdash; do the workflow manually in Edge; every click/field captures a real locator (typed values are never recorded)</span></h2>
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <input id="recurl" placeholder="application URL (leave empty for configured default)" style="flex:1;min-width:260px">
-      <button class="btn primary" id="recstart" onclick="recStart()">&#9210;&nbsp; Start recording</button>
-      <button class="btn" id="recstop" onclick="recStop()" style="display:none">&#9209;&nbsp; Stop &amp; review</button>
-      <span id="recstatus" class="sub" style="text-transform:none;letter-spacing:0"></span>
-    </div>
-    <div id="reccaptured" style="margin-top:14px"></div>
-  </section>
+def _get(url):
+    with urllib.request.urlopen(url, timeout=60) as r:
+        return json.loads(r.read())
 
-  <!-- ═════════ REVIEW & EDIT (AI changes await approval) ═════════ -->
-  <section class="card" id="reviewcard" style="grid-column:1 / -1;display:none">
-    <h2>Review Framework Intelligence Changes <span class="sub" style="text-transform:none;letter-spacing:0">
-        &mdash; edit anything below, then approve to update the framework and run</span></h2>
-    <div class="matchbar" id="matchbar"></div>
-    <div id="compilebadge"></div>
-    <div class="compare-cards" id="comparecards"></div>
-    <div id="aidecisions"></div>
-    <div class="rmeta" id="rmeta"></div>
-    <div id="rfiles"></div>
-    <div style="display:flex;gap:12px;margin-top:16px">
-      <button class="btn primary" style="padding:12px 26px" onclick="approve()">&#10003;&nbsp; Approve &amp; Run on Edge</button>
-      <button class="btn" style="padding:12px 22px" onclick="discard()">&#10005;&nbsp; Discard changes</button>
-    </div>
-  </section>
 
-  <!-- ═════════ REPORTS (sketch: full width below) ═════════ -->
-  <section class="card" id="reportcard" style="display:none">
-    <h2>Result Report <span class="spacer"></span>
-      <button class="btn" style="text-transform:none;letter-spacing:0;font-size:13.5px"
-              onclick="downloadReport()">&#8681;&nbsp; Download HTML report</button></h2>
-    <div class="kpis" id="kpis"></div>
-    <div class="charts">
-      <div>
-        <div class="chart-title">Scenario pass rate</div>
-        <div style="text-align:center"><svg id="donut" width="210" height="210" viewBox="0 0 200 200" role="img"></svg></div>
-        <div class="legend">
-          <span><span class="dot" style="background:var(--pass)"></span>Passed</span>
-          <span><span class="dot" style="background:var(--fail)"></span>Failed</span>
-        </div>
-      </div>
-      <div>
-        <div class="chart-title">Steps breakdown</div>
-        <div style="text-align:center"><svg id="stepdonut" width="210" height="210" viewBox="0 0 200 200" role="img"></svg></div>
-        <div class="legend">
-          <span><span class="dot" style="background:var(--pass)"></span>Passed</span>
-          <span><span class="dot" style="background:var(--fail)"></span>Failed</span>
-          <span><span class="dot" style="background:#f59e0b"></span>Skipped</span>
-        </div>
-      </div>
-      <div>
-        <div class="chart-title">Scenario results</div>
-        <div id="columns" class="cols"></div>
-      </div>
-    </div>
-    <div class="note" id="undefnote"></div>
-    <div class="note" id="errnote" style="background:var(--fail-soft);color:var(--fail)"></div>
-  </section>
-</main>
-<div id="toast"></div>
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--api", default="http://127.0.0.1:8000")
+    ap.add_argument("--txn", help="run by transaction number")
+    ap.add_argument("--feature", help="path to a .feature file to upload")
+    ap.add_argument("--brd", help="path to a BRD (.pdf/.docx/.txt)")
+    ap.add_argument("--ai", action="store_true", help="Framework Intelligence mode for --feature")
+    ap.add_argument("--timeout-min", type=int, default=60)
+    args = ap.parse_args()
 
-<script>
-const API = "";
-let tab = "up", job = null, offset = 0, timer = null, allTxns = [];
+    if args.txn:
+        job = _post(f"{args.api}/execute/txn/{args.txn if args.txn.lower().startswith('txn') else 'Txn' + args.txn}")
+    elif args.brd:
+        job = _post(f"{args.api}/execute/brd", files=("file", args.brd))
+    elif args.feature:
+        job = _post(f"{args.api}/execute/upload?ai={'true' if args.ai else 'false'}&dry_run=false",
+                    files=("file", args.feature))
+    else:
+        print("ERROR: one of --txn / --feature / --brd is required"); return 3
 
-function toast(m){ const t = document.getElementById("toast");
-  t.textContent = m; t.style.display = "block"; setTimeout(() => t.style.display = "none", 4200); }
-function v(id){ return document.getElementById(id).value.trim() || null; }
+    job_id = job["job_id"]
+    print(f"[ci] job {job_id} started")
+    deadline = time.time() + args.timeout_min * 60
+    last = ""
+    while time.time() < deadline:
+        j = _get(f"{args.api}/jobs/{job_id}")
+        if j["status"] != last:
+            print(f"[ci] status: {j['status']}")
+            last = j["status"]
+        if j["status"] in ("passed", "failed", "error", "review", "discarded", "locator_required"):
+            pathlib.Path(f"ci_report_{job_id}.json").write_text(json.dumps(j, indent=1))
+            s = j.get("summary", {})
+            print(f"[ci] scenarios: {s.get('scenarios_total', '?')} "
+                  f"passed: {s.get('scenarios_passed', '?')} failed: {s.get('scenarios_failed', '?')}")
+            if j["status"] == "passed":
+                return 0
+            if j["status"] == "locator_required":
+                print("[ci] LOCATOR DISCOVERY REQUIRED — new UI steps have no known locator. "
+                      "Record the screens (Locator Recorder) or run once with Capture Mode:")
+                for st in s.get("unresolved_steps", []):
+                    print(f"       - {st}")
+                return 4
+            if j["status"] == "review":
+                print("[ci] REVIEW REQUIRED — AI changes contain unresolved locators; "
+                      "a human must approve in the console before this can run.")
+                return 2
+            if j["status"] == "failed":
+                return 1
+            print(f"[ci] error: {s.get('error', 'unknown')}")
+            return 3
+        time.sleep(5)
+    print("[ci] TIMEOUT waiting for job"); return 3
 
-function setTab(t){ tab = t;
-  document.getElementById("tab-up").classList.toggle("active", t === "up");
-  document.getElementById("tab-ai").classList.toggle("active", t === "ai");
-  document.getElementById("tab-txn").classList.toggle("active", t === "txn");
-  document.getElementById("pane-up").style.display = t === "up" ? "" : "none";
-  document.getElementById("pane-ai").style.display = t === "ai" ? "" : "none";
-  document.getElementById("pane-txn").style.display = t === "txn" ? "" : "none";
-  closeDdl(); }
 
-/* ── index + searchable dropdown ─────────────────────────────────────── */
-async function loadTxns(){
-  try{
-    const r = await fetch(API + "/txns?all=1"); const d = await r.json();
-    allTxns = d.txns || [];
-    document.getElementById("idxinfo").textContent = d.count + " txns indexed";
-    document.getElementById("featcount").textContent = d.count;
-    renderDdl(allTxns);
-  }catch(e){}
-}
-function renderDdl(items){
-  const ddl = document.getElementById("ddl");
-  if (!items.length){ ddl.innerHTML = `<div class="empty">No matching transaction</div>`; return; }
-  ddl.innerHTML = items.slice(0, 400).map(x => {
-    const num = x.txn.replace(/^txn/i, "");
-    return `<div class="item" onmousedown="pick('${num}')">
-      <span class="num">${num}</span><span class="fname">${x.file}</span>
-      <span class="mod">${x.module}</span></div>`; }).join("")
-    + (items.length > 400 ? `<div class="empty">&hellip; ${items.length - 400} more — keep typing to narrow</div>` : "");
-}
-function filterDdl(){
-  const q = document.getElementById("txn").value.trim().toLowerCase().replace(/^txn/, "");
-  openDdl();
-  renderDdl(!q ? allTxns : allTxns.filter(x =>
-    x.txn.toLowerCase().includes(q) || (x.file || "").toLowerCase().includes(q)));
-}
-function openDdl(){ document.getElementById("ddl").classList.add("open"); }
-function closeDdl(){ document.getElementById("ddl").classList.remove("open"); }
-function pick(num){ document.getElementById("txn").value = num; closeDdl(); }
-document.addEventListener("click", e => { if (!document.getElementById("combo").contains(e.target)) closeDdl(); });
-
-async function rebuildIndex(){
-  const r = await fetch(API + "/index/rebuild", {method:"POST"}); const d = await r.json();
-  toast("Index rebuilt: " + d.indexed_txns + " transactions"); loadTxns(); }
-
-/* ── run / stop ──────────────────────────────────────────────────────── */
-async function run(){
-  resetPanels();
-  const btn = document.getElementById("runbtn"); btn.disabled = true;
-  try{
-    let res;
-    if (tab === "txn"){
-      const num = v("txn");
-      if (!num){ toast("Enter or select a transaction number."); btn.disabled = false; return; }
-      const txn = "Txn" + num.replace(/^txn/i, "");
-      stage("s1", "on");
-      res = await fetch(API + "/execute/txn/" + encodeURIComponent(txn) + "?capture=" + document.getElementById("captxn").checked,
-        {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    } else if (tab === "ai"){
-      const f = document.getElementById("fileai").files[0];
-      if (!f){ toast("Choose a .feature file or BRD."); btn.disabled = false; return; }
-      stage("s1", "on");
-      const fd = new FormData(); fd.append("file", f);
-      const isBrd = !f.name.toLowerCase().endsWith(".feature");
-      res = await fetch(API + (isBrd ? "/execute/brd" : "/execute/upload?ai=true"), {method:"POST", body:fd});
-    } else {
-      const f = document.getElementById("file").files[0];
-      if (!f){ toast("Choose a .feature file."); btn.disabled = false; return; }
-      stage("s1", "on");
-      const fd = new FormData(); fd.append("file", f);
-      res = await fetch(API + "/execute/upload?ai=false&capture=" + document.getElementById("capup").checked + "&dry_run=" + document.getElementById("dry").checked,
-        {method:"POST", body:fd});
-    }
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.detail || "Request failed");
-    job = d.job_id; offset = 0;
-    stage("s1", "done"); stage("s2", "on");
-    document.getElementById("jobmeta").textContent =
-      "— " + (d.txn ? d.txn + " (" + d.module + ")" : d.feature.split(/[\\\/]/).pop()) +
-      (d.tag ? "  ·  " + d.tag : "");
-    document.getElementById("stopbtn").style.display = "block";
-    timer = setInterval(poll, 1500);
-  }catch(err){ toast(err.message); setBadge("error"); btn.disabled = false; }
-}
-
-async function stopRun(){
-  if (!job) return;
-  try{
-    const r = await fetch(API + `/jobs/${job}/stop`, {method:"POST"});
-    if (r.ok) toast("Stopping execution — closing Edge…");
-  }catch(e){}
-}
-
-let reviewShown = false;
-const RAIL_LABELS = {
-  up:  ["Lookup", "Launch JVM", "Edge run", "Report"],
-  txn: ["Lookup", "Launch JVM", "Edge run", "Report"],
-  ai:  ["Match & Compare", "Normalize & Generate", "Compile & Review", "Execute"],
-};
-function resetPanels(){
-  reviewShown = false;
-  document.getElementById("reviewcard").style.display = "none";
-  document.getElementById("console").textContent = "";
-  document.getElementById("reportcard").style.display = "none";
-  document.getElementById("stopbtn").style.display = "none";
-  const labels = RAIL_LABELS[tab] || RAIL_LABELS.up;
-  ["s1","s2","s3","s4"].forEach((id, i) => {
-    const el = document.getElementById(id);
-    el.className = "stage"; el.textContent = labels[i];
-  });
-  setBadge("queued"); }
-function stage(id, cls){ document.getElementById(id).className = "stage " + cls; }
-function setBadge(s){ const b = document.getElementById("status"); b.className = "badge " + s; b.textContent = s; }
-
-/* ── polling ─────────────────────────────────────────────────────────── */
-async function poll(){
-  const r = await fetch(API + `/jobs/${job}/logs?offset=${offset}`);
-  const d = await r.json();
-  if (d.log){
-    const c = document.getElementById("console");
-    c.textContent += d.log; c.scrollTop = c.scrollHeight; offset = d.next_offset;
-    if (/Scenario|cucumber/i.test(d.log)){ stage("s3", "on"); stage("s2", "done"); }
-  }
-  setBadge(d.status);
-  if (d.status === "review" && !reviewShown){
-    reviewShown = true;
-    clearInterval(timer);
-    document.getElementById("stopbtn").style.display = "none";
-    await showReview();
-    return;
-  }
-  if (["passed","failed","error","stopped","discarded"].includes(d.status)){
-    clearInterval(timer);
-    document.getElementById("runbtn").disabled = false;
-    document.getElementById("stopbtn").style.display = "none";
-    stage("s2", "done");
-    stage("s3", d.status === "passed" ? "done" : d.status === "failed" ? "done" : "bad");
-    stage("s4", d.status === "passed" ? "done" : "bad");
-    const jr = await fetch(API + "/jobs/" + job); renderReport(await jr.json());
-  }
-}
-
-/* ── report (no error dumps — counts + 3 graphics only) ──────────────── */
-function renderReport(j){
-  const s = j.summary || {};
-  document.getElementById("reportcard").style.display = "block";
-  const total = s.scenarios_total ?? 0, pass = s.scenarios_passed ?? 0, fail = s.scenarios_failed ?? 0;
-  const sp = s.steps_passed ?? 0, sf = s.steps_failed ?? 0, sk = s.steps_skipped ?? 0;
-  const dur = (s.scenarios || []).reduce((a, x) => a + (x.duration_sec || 0), 0);
-  const rate = total ? Math.round(100 * pass / total) : 0;
-  const kpi = (n, label, cls="") => `<div class="kpi ${cls}"><b>${n}</b><span>${label}</span></div>`;
-  document.getElementById("kpis").innerHTML =
-    kpi(total, "scenarios") + kpi(pass, "passed", "p") + kpi(fail, "failed", "f") +
-    kpi(rate + "%", "pass rate", "a") + kpi(sp, "steps passed", "p") +
-    kpi(sf, "steps failed", "f") + kpi(sk, "steps skipped") +
-    kpi(dur ? dur.toFixed(1) + "s" : "—", "total time", "a");
-
-  lastReport = {summary: s, meta: document.getElementById("jobmeta").textContent,
-                status: j.status, when: new Date().toLocaleString()};
-  drawDonut(pass, fail);
-  drawStepsDonut(sp, sf, sk);
-  drawColumns(pass, fail);
-
-  const en = document.getElementById("errnote");
-  if (s.error){ en.style.display = "block"; en.textContent = s.error; }
-  else en.style.display = "none";
-  const hb = document.getElementById("healbtn");
-  if (hb) hb.remove();
-  if (String(document.getElementById("status").textContent) === "failed" && s.captures && s.captures.checkpoints > 0){
-    const b = document.createElement("button");
-    b.id = "healbtn"; b.className = "btn primary"; b.style.marginTop = "10px";
-    b.innerHTML = "&#128295;&nbsp; Self-heal locators with AI (uses captured DOM)";
-    b.onclick = async () => {
-      b.disabled = true; b.textContent = "Healing…";
-      const r = await fetch(API + `/jobs/${job}/heal`, {method: "POST"});
-      if (!r.ok){ toast((await r.json()).detail || "Heal failed."); b.disabled = false; return; }
-      toast("Self-heal started — watch the console.");
-      resetPanelsSoft && resetPanelsSoft(); pollTimer = setInterval(poll, 1200);
-    };
-    en.parentNode.insertBefore(b, en.nextSibling);
-  }
-  const u = document.getElementById("undefnote");
-  if (s.undefined_steps && s.undefined_steps.length){
-    u.style.display = "block";
-    u.textContent = s.undefined_steps.length +
-      " step(s) in this feature have no matching step definition in the framework — they were skipped.";
-  } else u.style.display = "none";
-}
-
-function drawDonut(pass, fail){
-  const total = pass + fail, svg = document.getElementById("donut");
-  if (!total){ svg.innerHTML = `<text x="100" y="105" text-anchor="middle" fill="#64748b" font-size="13">no scenarios</text>`; return; }
-  const R = 78, C = 2 * Math.PI * R, passLen = C * pass / total;
-  svg.innerHTML = `
-    <circle cx="100" cy="100" r="${R}" fill="none" stroke="#dc2626" stroke-width="26"/>
-    <circle cx="100" cy="100" r="${R}" fill="none" stroke="#16a34a" stroke-width="26"
-      stroke-linecap="${pass && fail ? "butt" : "round"}"
-      stroke-dasharray="${passLen} ${C - passLen}" stroke-dashoffset="${C / 4}"
-      style="transition:stroke-dasharray .8s ease"/>
-    <circle cx="100" cy="100" r="52" fill="#fff"/>
-    <text x="100" y="97" text-anchor="middle" font-size="30" font-weight="800" fill="#101a2e">${Math.round(100 * pass / total)}%</text>
-    <text x="100" y="119" text-anchor="middle" font-size="11" fill="#64748b" letter-spacing="1">PASSED</text>`;
-}
-
-function drawStepsDonut(p, f, k){
-  const svg = document.getElementById("stepdonut"), tot = p + f + k;
-  if (!tot){ svg.innerHTML = `<text x="100" y="105" text-anchor="middle" fill="#64748b" font-size="13">no steps</text>`; return; }
-  const R = 78, C = 2 * Math.PI * R, off = C / 4;
-  const arc = (len, color) =>
-    `<circle cx="100" cy="100" r="${R}" fill="none" stroke="${color}" stroke-width="26"
-      stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${off}" style="transition:stroke-dasharray .8s ease"/>`;
-  // layered rings: skipped as the base, failed over [0, p+f), passed over [0, p)
-  svg.innerHTML =
-    `<circle cx="100" cy="100" r="${R}" fill="none" stroke="#f59e0b" stroke-width="26"/>` +
-    arc(C * (p + f) / tot, "#dc2626") + arc(C * p / tot, "#16a34a") +
-    `<circle cx="100" cy="100" r="52" fill="#fff"/>` +
-    `<text x="100" y="93" text-anchor="middle" font-size="26" font-weight="800" fill="#101a2e">${tot}</text>` +
-    `<text x="100" y="115" text-anchor="middle" font-size="11" fill="#64748b" letter-spacing="1">TOTAL STEPS</text>`;
-}
-
-function drawColumns(pass, fail){
-  const max = Math.max(pass, fail, 1);
-  const col = (v, color, lab) => `
-    <div class="col">
-      <span class="val" style="color:${color}">${v}</span>
-      <div class="bar" style="height:${Math.max(10, 150 * v / max)}px;background:linear-gradient(180deg,${color},${color}cc)"></div>
-      <span class="lab">${lab}</span>
-    </div>`;
-  document.getElementById("columns").innerHTML =
-    col(pass, "#16a34a", "Passed") + col(fail, "#dc2626", "Failed");
-}
-
-let lastReport = null;
-function downloadReport(){
-  if (!lastReport) return;
-  const s = lastReport.summary;
-  const donut = document.getElementById("donut").outerHTML;
-  const sdonut = document.getElementById("stepdonut").outerHTML;
-  const detail = (s.scenarios || []).map((sc, i) => {
-    const steps = (sc.steps || []).map((st, n) => {
-      const cls = st.status === "passed" ? "passed" : st.status === "failed" ? "failed"
-                : st.status === "skipped" ? "skipped" : "other";
-      let row = `<tr><td class="n">${n + 1}</td><td>${esc(st.keyword)} ${esc(st.name)}</td>
-        <td class="${cls}">${esc(st.status).toUpperCase()}</td>
-        <td class="t">${st.duration_sec ? st.duration_sec.toFixed(1) + "s" : "&mdash;"}</td></tr>`;
-      if (st.status === "failed" && st.error)
-        row += `<tr class="whyrow"><td></td><td colspan="3">
-          <div class="why"><b>Why it failed:</b><pre>${esc(st.error)}</pre></div></td></tr>`;
-      return row;
-    }).join("");
-    return `<div class="scen">
-      <h3><span class="idx">Scenario ${i + 1}</span> ${esc(sc.name)}
-        <span class="pill ${sc.status}">${sc.status.toUpperCase()}</span>
-        <span class="dur">${(sc.duration_sec || 0).toFixed(1)}s</span></h3>
-      <table><tr><th>#</th><th>Step</th><th>Result</th><th>Time</th></tr>${steps}</table>
-    </div>`;
-  }).join("");
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Execution Report</title>
-<style>
- body{font-family:"Segoe UI",Arial,sans-serif;color:#101a2e;margin:40px auto;max-width:1000px;padding:0 20px}
- h1{font-size:22px} h2{font-size:16px;margin:36px 0 10px;text-transform:uppercase;letter-spacing:.8px;color:#64748b}
- .meta{color:#64748b;font-size:14px;margin-bottom:26px}
- .kpis{display:flex;flex-wrap:wrap;gap:14px;margin:20px 0 30px}
- .kpi{border:1px solid #e2e8f2;border-radius:12px;padding:14px 22px;min-width:130px}
- .kpi b{display:block;font-size:30px} .kpi span{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.6px}
- .charts{display:flex;gap:60px;justify-content:center;margin:10px 0 34px;flex-wrap:wrap;text-align:center}
- .ct{font-size:13px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}
- .scen{border:1px solid #e2e8f2;border-radius:12px;padding:16px 20px;margin:16px 0;page-break-inside:avoid}
- .scen h3{display:flex;align-items:center;gap:12px;font-size:15px;margin:0 0 12px;flex-wrap:wrap}
- .idx{color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
- .pill{font-size:11px;font-weight:800;padding:3px 12px;border-radius:20px;letter-spacing:.5px}
- .pill.passed{background:#e7f6ec;color:#16a34a} .pill.failed{background:#fdecec;color:#dc2626}
- .dur{margin-left:auto;color:#64748b;font-size:13px;font-family:Consolas,monospace}
- table{border-collapse:collapse;width:100%;font-size:13.5px}
- th,td{border-bottom:1px solid #eef1f7;text-align:left;padding:8px 10px;vertical-align:top}
- th{color:#64748b;font-size:11.5px;text-transform:uppercase;letter-spacing:.6px}
- td.n{color:#94a3b8;width:30px} td.t{color:#64748b;font-family:Consolas,monospace;width:70px;white-space:nowrap}
- td.passed{color:#16a34a;font-weight:700;width:90px} td.failed{color:#dc2626;font-weight:700;width:90px}
- td.skipped{color:#b45309;font-weight:700;width:90px} td.other{color:#64748b;font-weight:700;width:90px}
- .whyrow td{border-bottom:1px solid #eef1f7;background:#fff8f8}
- .why{border-left:3px solid #dc2626;padding:8px 14px;font-size:13px;color:#7f1d1d}
- .why pre{white-space:pre-wrap;word-break:break-word;font-family:Consolas,monospace;font-size:12px;margin:6px 0 0;color:#8f2c2c}
- .foot{color:#94a3b8;font-size:12px;margin-top:34px}
- @media print{.scen{box-shadow:none}}
-</style></head><body>
-<h1>Txn Automation &mdash; Execution Report</h1>
-<div class="meta">${esc(lastReport.meta)} &nbsp;&bull;&nbsp; Status: <b>${esc(lastReport.status)}</b>
- &nbsp;&bull;&nbsp; Generated: ${esc(lastReport.when)}</div>
-<div class="kpis">
- <div class="kpi"><b>${s.scenarios_total ?? 0}</b><span>Scenarios</span></div>
- <div class="kpi"><b style="color:#16a34a">${s.scenarios_passed ?? 0}</b><span>Passed</span></div>
- <div class="kpi"><b style="color:#dc2626">${s.scenarios_failed ?? 0}</b><span>Failed</span></div>
- <div class="kpi"><b style="color:#16a34a">${s.steps_passed ?? 0}</b><span>Steps passed</span></div>
- <div class="kpi"><b style="color:#dc2626">${s.steps_failed ?? 0}</b><span>Steps failed</span></div>
- <div class="kpi"><b style="color:#b45309">${s.steps_skipped ?? 0}</b><span>Steps skipped</span></div>
-</div>
-<div class="charts">
- <div><div class="ct">Scenario pass rate</div>${donut}</div>
- <div><div class="ct">Steps breakdown</div>${sdonut}</div>
-</div>
-<h2>Detailed step results</h2>
-${detail || "<p>No scenario data in this run.</p>"}
-<div class="foot">Generated by Txn Automation Console</div>
-</body></html>`;
-  const blob = new Blob([html], {type: "text/html"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "execution-report-" + (job || "run") + ".html";
-  a.click(); URL.revokeObjectURL(a.href);
-}
-
-/* ── review editor ───────────────────────────────────────────────────── */
-async function showReview(){
-  const r = await fetch(API + `/jobs/${job}/pending`);
-  if (!r.ok){ toast("Could not load pending changes."); return; }
-  const p = await r.json();
-  const m = p.meta || {};
-  const match = p.match || {};
-
-  // ── match banner: which existing feature this was compared against ──
-  const mb = document.getElementById("matchbar");
-  if (match.is_new_feature){
-    mb.className = "matchbar newfeat";
-    mb.innerHTML = `&#9888;&nbsp; No existing feature matched — treated as a <b>brand-new transaction</b>. `
-      + `Locators for any new UI elements will need manual verification.`;
-  } else {
-    const conf = match.confidence != null ? ` &middot; matched by content (confidence ${Math.round(match.confidence * 100)}%)` : ` &middot; exact transaction match`;
-    mb.className = "matchbar";
-    mb.innerHTML = `&#128269;&nbsp; Compared against <b>${esc(match.txn || "")}</b> `
-      + `(module: ${esc(match.module || "")})${conf}`;
-  }
-
-  // ── compile status badge ──
-  const cb = document.getElementById("compilebadge");
-  const fileCount = Object.keys(p.files || {}).length;
-  cb.innerHTML = fileCount
-    ? `<span class="compilebadge">&#10003; ${fileCount} java file(s) generated &amp; compiled successfully</span>`
-    : `<span class="compilebadge" style="background:#eef1f7;color:var(--muted)">No new java needed — all steps already have glue</span>`;
-
-  // ── comparison summary cards ──
-  const cs = m.comparison_summary || {};
-  const untouchedCount = (m.scenarios_unreferenced || []).length;
-  document.getElementById("comparecards").innerHTML = [
-    ["unchanged", cs.unchanged ?? 0, "Unchanged"],
-    ["new", (m.scenarios_added || []).length, "New"],
-    ["modified", (m.scenarios_replaced || []).length, "Modified"],
-    ["kept", untouchedCount, "Kept (not deleted)"],
-  ].map(([cls, n, label]) => `<div class="ccard ${cls}"><b>${n}</b><span>${label}</span></div>`).join("");
-
-  // ── AI decisions: what normalization changed before generation ran ──
-  const norm = m.normalization || {};
-  const rows = [];
-  (norm.tags_normalized || []).forEach(x => rows.push(
-    `<span class="tag">tag</span> <code>${esc(x.from)}</code> &rarr; <code>${esc(x.to)}</code> (matched framework convention)`));
-  (norm.scenarios_renamed || []).forEach(x => rows.push(
-    `<span class="tag" style="background:#0ea5e9">rename</span> "${esc(x.from)}" &rarr; "${esc(x.to)}" (${Math.round(x.similarity*100)}% match to existing scenario)`));
-  (norm.steps_normalized || []).forEach(x => rows.push(
-    `<span class="tag" style="background:#16a34a">step</span> <code>${esc(x.from)}</code> &rarr; <code>${esc(x.to)}</code>`));
-  (norm.examples_headers_normalized || []).forEach(x => rows.push(
-    `<span class="tag" style="background:#f59e0b">examples</span> [${x.from.join(", ")}] &rarr; [${x.to.join(", ")}]`));
-  document.getElementById("aidecisions").innerHTML = rows.length
-    ? `<div class="ai-decisions"><b style="font-size:12px;color:var(--muted)">AI DECISIONS &mdash; wording aligned to framework conventions before generation:</b>`
-      + rows.map(r => `<div class="row">${r}</div>`).join("") + `</div>` : "";
-
-  document.getElementById("rmeta").innerHTML =
-    `<b>${(m.scenarios_added || []).length}</b> new scenario(s) &nbsp;&middot;&nbsp; ` +
-    `<b>${(m.scenarios_replaced || []).length}</b> changed scenario(s) &nbsp;&middot;&nbsp; ` +
-    `<b>${(m.undefined_steps || []).length}</b> step(s) got new java glue` +
-    ((m.undefined_steps || []).length ? " — look for <b>// TODO QA: verify locator</b> markers in the java below" : "");
-  const wrap = document.getElementById("rfiles");
-  wrap.innerHTML = "";
-  const addEditor = (label, tag, key, content, oldContent) => {
-    const div = document.createElement("div"); div.className = "rfile";
-    const head = document.createElement("div"); head.className = "fhead";
-    head.innerHTML = `<span class="ftag">${tag}</span> ${esc(label)}`;
-    const editBtn = document.createElement("button");
-    editBtn.className = "edittoggle"; editBtn.type = "button"; editBtn.textContent = "Edit";
-    head.appendChild(editBtn);
-
-    const ta = document.createElement("textarea");
-    ta.className = "code"; ta.spellcheck = false; ta.value = content;
-    ta.dataset.key = key; ta.style.display = "none";
-
-    const ops = diffLines(oldContent || "", content || "");
-    const added = ops.filter(o => o.type === "added").length;
-    const removed = ops.filter(o => o.type === "removed").length;
-    const summary = document.createElement("div"); summary.className = "diffsummary";
-    summary.innerHTML = (oldContent == null)
-      ? `<span>New file — every line added</span>`
-      : `<b class="added">+${added}</b> <span>added</span> &nbsp; <b class="removed">-${removed}</b> <span>removed</span>`;
-
-    const dv = document.createElement("div"); dv.className = "diffview";
-    dv.innerHTML = ops.map(o =>
-      `<div class="dline ${o.type}">${esc(o.line)}</div>`).join("") || `<div class="dline same">(empty)</div>`;
-
-    editBtn.onclick = () => {
-      const editing = ta.style.display !== "none";
-      ta.style.display = editing ? "none" : "block";
-      dv.style.display = editing ? "block" : "none";
-      summary.style.display = editing ? "flex" : "none";
-      editBtn.textContent = editing ? "Edit" : "Done editing";
-    };
-
-    div.appendChild(head); div.appendChild(summary); div.appendChild(dv); div.appendChild(ta);
-    wrap.appendChild(div);
-  };
-  addEditor("merged feature file (will replace the framework copy)", "feature", "__feature__",
-           p.feature_text || "", p.old_feature_text || "");
-  for (const [rel, code] of Object.entries(p.files || {}))
-    addEditor(rel, rel.includes("stepDefinitions") ? "steps" : "page/java", rel, code,
-             (p.old_files || {})[rel]);
-  document.getElementById("reviewcard").style.display = "block";
-  document.getElementById("reviewcard").scrollIntoView({behavior: "smooth"});
-  toast("Framework Intelligence changes are ready — review, edit if needed, then approve.");
-}
-
-/* ── Locator Recorder ─────────────────────────────────────────────────── */
-let recPoll = null;
-async function recStart(){
-  const r = await fetch(API + "/recorder/start", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({url: document.getElementById("recurl").value || null})});
-  if (!r.ok){ toast((await r.json()).detail || "Could not start recorder."); return; }
-  document.getElementById("recstart").style.display = "none";
-  document.getElementById("recstop").style.display = "";
-  document.getElementById("reccaptured").innerHTML = "";
-  recPoll = setInterval(async () => {
-    const st = await (await fetch(API + "/recorder/status")).json();
-    document.getElementById("recstatus").textContent =
-      st.running ? `recording… ${st.captured} element(s) captured` : "";
-  }, 1500);
-  toast("Edge launched — perform the workflow manually, then click Stop & review.");
-}
-async function recStop(){
-  clearInterval(recPoll);
-  const data = await (await fetch(API + "/recorder/stop", {method:"POST"})).json();
-  document.getElementById("recstart").style.display = "";
-  document.getElementById("recstop").style.display = "none";
-  document.getElementById("recstatus").textContent = `${data.captured} element(s) captured`;
-  const wrap = document.getElementById("reccaptured");
-  if (!data.events.length){ wrap.innerHTML = '<div class="note">No elements captured.</div>'; return; }
-  wrap.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12.5px">
-    <tr style="text-align:left;color:var(--muted);text-transform:uppercase;font-size:10.5px;letter-spacing:.5px">
-      <th style="padding:6px">Keep</th><th>Element</th><th>Field name (edit)</th><th>Locator</th><th>Screen</th></tr>` +
-    data.events.map((e, i) => {
-      const top = e.candidates[0] || {};
-      return `<tr style="border-top:1px solid var(--line)">
-        <td style="padding:6px"><input type="checkbox" class="reckeep" data-i="${i}" checked></td>
-        <td>${esc(e.kind)} &middot; &lt;${esc(e.tag)}&gt; ${esc((e.text || "").slice(0, 30))}</td>
-        <td><input class="recname" data-i="${i}" value="${esc(e.suggested_name)}" style="width:95%"></td>
-        <td><code style="font-family:var(--mono);font-size:11.5px">${esc(top.java || "")}</code>
-            ${top.note ? `<div style="color:var(--fail);font-size:10.5px">${esc(top.note)}</div>` : ""}</td>
-        <td style="color:var(--muted)">${esc((e.title || "").slice(0, 30))}</td></tr>`;
-    }).join("") + `</table>
-    <button class="btn primary" style="margin-top:12px" onclick="recSave()">&#128190;&nbsp; Save selected to locator repository</button>`;
-  window.__recEvents = data.events;
-}
-async function recSave(){
-  const entries = [];
-  document.querySelectorAll(".reckeep:checked").forEach(cb => {
-    const i = +cb.dataset.i, e = window.__recEvents[i];
-    const top = e.candidates[0] || {};
-    entries.push({name: document.querySelector(`.recname[data-i="${i}"]`).value,
-                  java: top.java, locator_type: top.locator_type,
-                  locator_value: top.locator_value, screen: e.title, url: e.url});
-  });
-  const r = await (await fetch(API + "/recorder/save", {method:"POST",
-    headers:{"Content-Type":"application/json"}, body: JSON.stringify({entries})})).json();
-  toast(`Saved ${r.added} locator(s) — repository now has ${r.total}. Future AI generations will use them.`);
-}
-
-/* ── vanilla-JS line diff (LCS-based) — highlights added/removed lines ─── */
-function diffLines(oldText, newText){
-  const a = oldText ? oldText.split("\n") : [];
-  const b = newText ? newText.split("\n") : [];
-  const n = a.length, m = b.length;
-  const dp = Array.from({length: n + 1}, () => new Int32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--)
-      dp[i][j] = a[i] === b[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
-  const ops = [];
-  let i = 0, j = 0;
-  while (i < n && j < m){
-    if (a[i] === b[j]){ ops.push({type:"same", line:a[i]}); i++; j++; }
-    else if (dp[i+1][j] >= dp[i][j+1]){ ops.push({type:"removed", line:a[i]}); i++; }
-    else { ops.push({type:"added", line:b[j]}); j++; }
-  }
-  while (i < n){ ops.push({type:"removed", line:a[i]}); i++; }
-  while (j < m){ ops.push({type:"added", line:b[j]}); j++; }
-  return ops;
-}
-
-async function approve(){
-  const files = {}; let feature = null;
-  document.querySelectorAll("#rfiles textarea.code").forEach(ta => {
-    if (ta.dataset.key === "__feature__") feature = ta.value;
-    else files[ta.dataset.key] = ta.value;
-  });
-  const r = await fetch(API + `/jobs/${job}/approve`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({feature_text: feature, files})});
-  const d = await r.json();
-  if (r.status === 422){
-    toast("Edited java does not compile — see console for errors.");
-    const c = document.getElementById("console");
-    c.textContent += "\n" + (d.detail || ""); c.scrollTop = c.scrollHeight;
-    return;                                   // stay in review, user can fix
-  }
-  if (!r.ok){ toast(d.detail || "Approve failed"); return; }
-  document.getElementById("reviewcard").style.display = "none";
-  document.getElementById("stopbtn").style.display = "block";
-  setBadge("running");
-  timer = setInterval(poll, 1500);
-}
-
-async function discard(){
-  const r = await fetch(API + `/jobs/${job}/discard`, {method: "POST"});
-  if (r.ok){
-    document.getElementById("reviewcard").style.display = "none";
-    setBadge("discarded");
-    document.getElementById("runbtn").disabled = false;
-    toast("Changes discarded — the framework was not modified.");
-  }
-}
-
-function esc(x){ return String(x ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-loadTxns();
-</script>
-</body>
-</html>
+if __name__ == "__main__":
+    sys.exit(main())
