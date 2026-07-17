@@ -1,621 +1,767 @@
 """
-FastAPI orchestrator for the Java Cucumber framework.
+Runs the Java framework via Maven as a subprocess.
 
-Flow 1 (manager's primary flow):
-    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
+Key trick (why no Java knowledge is needed):
+  Cucumber system properties OVERRIDE whatever is hardcoded in @CucumberOptions
+  inside TestRunner.java. So we can point the SAME TestRunner at any single
+  feature file — including one sitting in our own uploads folder — with:
 
-Flow 2 (alternate flow):
-    POST /execute/upload            -> user uploads a .feature file; we detect its module,
-                                       dry-run to verify glue code exists, then execute it
+      mvn test -Dtest=TestRunner
+               -Dcucumber.features=<absolute path to .feature>
+               -Dcucumber.plugin=json:<report path>
+               -Dbrowser=edge
 
-Common:
-    GET  /jobs/{job_id}             -> status + pass/fail summary
-    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
-    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
-    POST /index/rebuild             -> rescan the framework after new features are added
-
-Run with:  uvicorn app.main:app --reload --port 8000
+  Nothing inside the framework is modified, so nothing needs restoring.
 """
+import json
+import os
 import re
-
+import subprocess
+import threading
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-from . import config, executor, indexer, knowledge, framework_scanner, feature_matcher, feature_comparator, feature_normalizer, merge_engine, knowledge_graph, brd_processor, recorder, capture, runtime_capture
+from . import config
 
+JOBS: dict[str, "Job"] = {}
 
-class RunParams(BaseModel):
-    """Target environment + credentials for one execution.
-    All optional — omit any value to keep whatever the properties file already has."""
-    url: str | None = None
-    maker_id: str | None = None
-    maker_password: str | None = None
-    checker_id: str | None = None
-    checker_password: str | None = None
+# The properties file is shared state -> only one execution at a time.
+_RUN_LOCK = threading.Lock()
 
-app = FastAPI(title="Java Framework Orchestrator")
+_SECRET_RE = re.compile(r"(-D\w*[Pp]assword=)(\S+)")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # your Next.js dev server
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
+def _effective_classpath() -> str:
+    """Assemble the classpath. If it involves recursively-scanned jar folders
+    or would exceed the Windows command-line limit, pack everything into a
+    'pathing jar' (a jar whose manifest Class-Path lists all entries) and
+    return just that jar's path."""
+    import glob
+    from urllib.request import pathname2url
 
-@app.on_event("startup")
-def _startup():
-    if config.FRAMEWORK_ROOT.exists():
-        indexer.build_index()
-        try:
-            knowledge.build_knowledge()
-        except Exception:  # noqa: BLE001
-            pass
+    entries: list[str] = []
+    override = getattr(config, "CLASSPATH_OVERRIDE", "")
+    if override:
+        entries.extend(x for x in override.split(config.CP_SEP) if x.strip())
+    else:
+        entries.extend(config.CLASSPATH_ENTRIES)
 
-
-# ─────────────────────────── index endpoints ────────────────────────────────
-@app.post("/index/rebuild")
-def rebuild_index():
-    idx = indexer.build_index()
-    return {"indexed_txns": len(idx)}
-
-
-@app.post("/knowledge/rebuild")
-def rebuild_knowledge(embed: bool = False):
-    """Rescan the WHOLE framework into the AI knowledge base. With ?embed=1,
-    also (re)build the RAG embeddings via Azure (needs an embedding deployment)."""
-    kb = knowledge.build_knowledge()
-    stats = dict(kb["stats"])
-    if embed:
-        stats.update(knowledge.build_embeddings())
-    stats["rag_embeddings"] = knowledge.embeddings_available()
-    return stats
-
-
-@app.get("/knowledge/stats")
-def knowledge_stats():
-    stats = dict(knowledge.get_knowledge()["stats"])
-    stats["rag_embeddings"] = knowledge.embeddings_available()
-    return stats
-
-
-# ═══════════════ Phase 1 — Framework Scanner (additive, new) ═══════════════
-# Separate from /knowledge/* (app/knowledge.py), which continues to power the
-# existing AI-generation RAG exactly as before. These endpoints expose the
-# richer, feature/scenario-level scan for future phases (matching, comparison,
-# normalization) and for direct browsing/search.
-@app.post("/framework/scan")
-def framework_scan():
-    kb = framework_scanner.scan_framework()
-    return kb["stats"]
-
-
-@app.get("/framework/stats")
-def framework_stats():
-    return framework_scanner.get_framework_knowledge()["stats"]
-
-
-@app.get("/framework/features/search")
-def framework_search(q: str, limit: int = 20):
-    return {"results": framework_scanner.search_features(q, limit)}
-
-
-# ═══════════════ Phase 6 — Intelligent Feature Matching (additive, new) ═════
-class MatchRequest(BaseModel):
-    text: str
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-    top_k: int = 5
-
-
-@app.post("/framework/match")
-def framework_match(body: MatchRequest):
-    """Rank every framework feature against the given text — five signals
-    (txn/module/tags/scenario-lexical/semantic). Standalone + testable; not
-    yet wired into /execute/upload (that comes with Phase 7 Comparison)."""
-    return {"matches": feature_matcher.find_matches(
-        body.text, body.filename, body.module_hint, body.txn_hint, body.top_k)}
-
-
-@app.post("/framework/embeddings/rebuild")
-def framework_embeddings_rebuild():
-    """Embed every feature (name + scenario names) for the semantic_similarity
-    signal in /framework/match. Requires AZURE_OPENAI_EMBED_DEPLOYMENT."""
-    return feature_matcher.build_feature_embeddings()
-
-
-# ═══════════════ Phase 7 — Intelligent Feature Comparison (additive, new) ══
-class CompareRequest(BaseModel):
-    uploaded_text: str
-    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-
-
-@app.post("/framework/compare")
-def framework_compare(body: CompareRequest):
-    """Structured diff: unchanged / new / deleted / modified scenarios, with
-    step-level, Examples-level, and data-table-level detail for each modified
-    scenario. If existing_text is omitted, the best match is found
-    automatically (Phase 6). Not yet wired into /execute/upload."""
-    try:
-        if body.existing_text is not None:
-            return feature_comparator.compare_features(body.existing_text, body.uploaded_text)
-        return feature_comparator.compare_with_best_match(
-            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-# ═══════════════ Phase 8 — Feature Normalization (additive, new) ════════════
-class NormalizeRequest(BaseModel):
-    uploaded_text: str
-
-
-@app.post("/framework/normalize")
-def framework_normalize(body: NormalizeRequest):
-    """Rewrite an uploaded feature to the framework's conventions: step wording
-    canonicalized to existing glue (so no Java is generated for steps the
-    framework can already run), tags recased/deduped, formatting standardized.
-    Deterministic; every rewrite is listed in `changes` for human review."""
-    try:
-        return feature_normalizer.normalize_feature(body.uploaded_text)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-# ═══════════════ Phase 8 — Feature Normalization (additive, new) ═══════════
-class NormalizeRequest(BaseModel):
-    uploaded_text: str
-    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-
-
-@app.post("/framework/normalize")
-def framework_normalize(body: NormalizeRequest):
-    """Rewrite the uploaded feature to match framework conventions (tag
-    casing, step wording, scenario naming, Examples headers) BEFORE any Java
-    generation. If existing_text is omitted, the best match is auto-found
-    (Phase 6). Not yet wired into /execute/upload."""
-    try:
-        if body.existing_text is not None:
-            return feature_normalizer.normalize_feature(body.uploaded_text, body.existing_text)
-        return feature_normalizer.normalize_with_best_match(
-            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-# ═══════════════ Phase 9 — Intelligent Merge Engine (additive, new) ═════════
-class MergeRequest(BaseModel):
-    existing_text: str
-    normalized_text: str
-
-
-@app.post("/framework/merge")
-def framework_merge(body: MergeRequest):
-    """Merge a normalized upload into an existing feature's text: keep
-    unchanged, replace modified, append new, never delete, formatting/comments
-    of untouched content preserved. Pass Phase 8's normalized_text here."""
-    return merge_engine.merge(body.existing_text, body.normalized_text)
-
-
-class PipelineRequest(BaseModel):
-    uploaded_text: str
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-
-
-@app.post("/framework/pipeline")
-def framework_pipeline(body: PipelineRequest):
-    """Convenience: Match (Phase 6) -> Normalize (Phase 8) -> Merge (Phase 9)
-    in one call, with full transparency into each step. Not yet wired into
-    /execute/upload."""
-    return merge_engine.merge_pipeline(body.uploaded_text, body.filename,
-                                       body.module_hint, body.txn_hint)
-
-
-@app.get("/framework/archive/status")
-def archive_status():
-    """Browse the permanent archive (data/archive/<Txn>/<timestamp>/...) —
-    every file version ever replaced by an approved AI commit, never deleted."""
-    if not config.ARCHIVE_DIR.exists():
-        return {"count": 0, "entries": []}
-    entries = []
-    for txn_dir in sorted(config.ARCHIVE_DIR.iterdir()):
-        if not txn_dir.is_dir():
-            continue
-        for ts_dir in sorted(txn_dir.iterdir(), reverse=True):
-            if not ts_dir.is_dir():
-                continue
-            files = sorted(f.name for f in ts_dir.iterdir() if f.is_file())
-            entries.append({"txn": txn_dir.name, "timestamp": ts_dir.name,
-                           "files": files, "file_count": len(files)})
-    return {"count": len(entries), "entries": entries}
-
-
-# ═══════════════ Phase 3 — Knowledge Graph (additive, new) ══════════════════
-@app.post("/framework/graph/build")
-def graph_build():
-    """Scan the whole framework and build the Feature->Scenario->Step->
-    StepDefinition->PageMethod->Locator->TestData relationship graph."""
-    g = knowledge_graph.build_graph()
-    return g["stats"]
-
-
-@app.get("/framework/graph/stats")
-def graph_stats():
-    return knowledge_graph.get_graph()["stats"]
-
-
-@app.get("/framework/graph/trace")
-def graph_trace(step: str, keyword: str | None = None):
-    """'What does this step actually do?' — resolves a step sentence all the
-    way down to the page methods, locators, and test-data keys it touches."""
-    result = knowledge_graph.trace_step(step, keyword)
-    if result is None:
-        raise HTTPException(404, "No step definition matches this step text.")
-    return result
-
-
-@app.get("/framework/graph/impact")
-def graph_impact(locator: str):
-    """'What breaks if I change this locator?' — reverse lookup across every
-    page method, step definition, and scenario that touches it."""
-    return knowledge_graph.impact_of_locator(locator)
-
-
-@app.post("/execute/brd")
-async def execute_brd(file: UploadFile = File(...)):
-    """Upload a BRD (.pdf/.docx/.txt): AI drafts a feature file in the
-    framework's own conventions, then the draft enters the SAME Framework
-    Intelligence pipeline as a normal feature upload (match -> normalize ->
-    merge -> dry-run -> generate -> human review -> approve -> execute)."""
-    data = await file.read()
-    try:
-        brd_text = brd_processor.extract_text(file.filename, data)
-        result = brd_processor.brd_to_feature(brd_text, file.filename)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except RuntimeError as e:          # Azure config/network errors, already user-facing
-        raise HTTPException(502, str(e))
-
-    feature_text = result["feature_text"]
-    stem = Path(file.filename).stem
-    dest = config.UPLOADS_DIR / f"{stem}.feature"
-    dest.write_text(feature_text, encoding="utf-8")
-
-    hit = indexer.lookup(result["txn"]) if result["txn"] else None
-    job = executor.start_job(str(dest), ai_ctx={
-        "uploaded_text": feature_text, "filename": dest.name,
-        "hit": hit, "module": result["module"] or (hit or {}).get("module"),
-    })
-    out = job.public()
-    out["generated_feature"] = feature_text
-    out["brd_conversion"] = {"txn": result["txn"], "module": result["module"]}
-    return out
-
-
-# ═══════════ Locator Intelligence — human-workflow recorder (additive) ══════
-class RecorderStart(BaseModel):
-    url: str | None = None
-
-
-@app.post("/recorder/start")
-def recorder_start(body: RecorderStart):
-    """Launch Edge with the event recorder injected. A human then performs the
-    workflow MANUALLY in that window; every click/typed field captures the
-    element's DOM identity (never the typed values)."""
-    try:
-        return recorder.start(body.url or getattr(config, "RECORDER_DEFAULT_URL", ""))
-    except RuntimeError as e:
-        raise HTTPException(409 if "already running" in str(e) else 502, str(e))
-
-
-@app.get("/recorder/status")
-def recorder_status():
-    return recorder.status()
-
-
-@app.post("/recorder/stop")
-def recorder_stop():
-    """Close the recording browser and return every captured element with its
-    prioritized locator candidates + suggested Java field name, for review."""
-    return recorder.stop()
-
-
-class RecorderSave(BaseModel):
-    entries: list[dict]
-
-
-@app.post("/recorder/save")
-def recorder_save(body: RecorderSave):
-    """Persist reviewed locators to the Locator Knowledge Repository. They are
-    injected into every future AI generation, replacing TODO guesses."""
-    added = recorder.save_entries(body.entries)
-    return {"added": added, "total": len(recorder.load_repository())}
-
-
-@app.post("/jobs/{job_id}/heal")
-def job_heal(job_id: str):
-    """Self-healing: use the captured DOM of the failed screen to repair
-    locators, then route through review/approve (auto under CI policy)."""
-    try:
-        return executor.heal_job(job_id).public()
-    except KeyError as e:
-        raise HTTPException(409, str(e))
-
-
-@app.get("/jobs/{job_id}/captures")
-def job_captures(job_id: str):
-    idx = runtime_capture.capture_dir_for(job_id) / "index.json"
-    if not idx.exists():
-        raise HTTPException(404, "No captures for this job.")
-    import json as _json
-    return {"checkpoints": _json.loads(idx.read_text())}
-
-
-# ═══════════ Capture Mode — runtime inspection ingestion (additive) ═════════
-class CaptureIn(BaseModel):
-    run_id: str | None = None
-    txn: str | None = None
-    checkpoint: str
-    html: str | None = None
-    screenshot_b64: str | None = None
-    metadata: dict | None = None
-
-
-@app.post("/capture/ingest")
-def capture_ingest(body: CaptureIn):
-    """Receive one runtime capture pushed by the Java framework when it reaches
-    a checkpoint screen. The framework navigates; this only stores what it
-    saw. Screenshot+HTML+metadata are persisted for AI reasoning."""
-    return capture.store_capture(body.run_id, body.txn, body.checkpoint,
-                                 body.html or "", body.screenshot_b64 or "", body.metadata)
-
-
-@app.get("/capture/list")
-def capture_list(run_id: str | None = None, txn: str | None = None):
-    return {"captures": capture.list_captures(run_id, txn)}
-
-
-@app.get("/txns")
-def search_txns(q: str = "", all: bool = False):
-    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
-    offer a scrollable, searchable dropdown of every feature."""
-    idx = indexer.get_index()
-    q = q.lower()
-    items = []
-    from pathlib import Path as _P
-    for k, v in idx.items():
-        if not v.get("feature"):
-            continue  # java-only entries can't be executed — keep them out of the picker
-        name = v.get("txn") or k
-        if q and q not in name.lower() and q not in (v.get("feature") or "").lower():
-            continue
-        items.append({"txn": name, "module": v.get("module") or "",
-                      "file": _P(v["feature"]).name})
-    items.sort(key=lambda x: int(re.sub(r"\D", "", x["txn"]) or 0))
-    if not all:
-        items = items[:50]
-    return {"count": len(items), "txns": items}
-
-
-# ───────────────────────── flow 1: run by txn number ────────────────────────
-@app.post("/execute/txn/{txn_no}")
-def execute_txn(txn_no: str, capture: bool = False, params: RunParams | None = None):
-    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
-    We locate the feature via the index, VERIFY the matching @tag exists inside
-    the feature file, then run with cucumber.filter.tags=<that exact tag> —
-    same effect as replacing the number in TestRunner's tags, but with no
-    Java edit and no recompile."""
-    hit = indexer.lookup(txn_no)
-    if not hit:
-        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
-    if not hit.get("feature"):
-        raise HTTPException(409,
-            f"{hit['txn']} has step-definition/page Java files but NO .feature file was found "
-            f"for this number anywhere under {config.FEATURES_DIR.name}. This transaction is "
-            f"not automatable until its feature file exists (check the filename's Txn number).")
-
-    # find the matching tag inside the feature file. Frameworks tag in several
-    # styles, so we accept (in priority order):
-    #   1. @Txn012000                              (exact, any casing)
-    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
-    #   3. @12000                                  (bare number, zero-padding ignored)
-    from pathlib import Path as _P
-    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
-    tags_in_file = re.findall(r"@[\w]+", text)
-    digits = re.sub(r"\D", "", txn_no)
-
-    def _match_rank(t: str) -> int:
-        low = t.lower().lstrip("@")
-        if low == f"txn{digits}".lower():
-            return 1
-        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
-            return 2
-        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
-            return 3
-        return 99
-
-    tag = min(tags_in_file, key=_match_rank, default=None)
-    if tag is not None and _match_rank(tag) == 99:
-        tag = None
-    if not tag:
-        raise HTTPException(409,
-            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
-            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
-            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
-
-    job = executor.start_job(hit["feature"],
-                             run_params=params.model_dump() if params else None,
-                             tag_filter=tag)
-    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
-
-
-# ───────────────────── flow 2: run an uploaded feature ──────────────────────
-@app.post("/execute/upload")
-async def execute_upload(
-    file: UploadFile = File(...),
-    dry_run: bool = False,
-    ai: bool = False,
-    capture: bool = False,
-    url: str | None = Form(None),
-    maker_id: str | None = Form(None),
-    maker_password: str | None = Form(None),
-    checker_id: str | None = Form(None),
-    checker_password: str | None = Form(None),
-):
-    if not file.filename.endswith(".feature"):
-        raise HTTPException(400, "Please upload a .feature file.")
-    text = (await file.read()).decode("utf-8", errors="ignore")
-    import re as _re
-    has_feature = _re.search(r"^\s*(?:@\S+\s*)*Feature:", text, _re.M)
-    has_scenario = _re.search(r"^\s*Scenario(?: Outline)?:", text, _re.M)
-    has_step = _re.search(r"^\s*(?:Given|When|Then|And|But)\s+\S", text, _re.M)
-    if not (has_feature and has_scenario and has_step):
-        missing = [n for ok, n in [(has_feature, "a 'Feature:' header"),
-                                    (has_scenario, "a 'Scenario:' line"),
-                                    (has_step, "Given/When/Then steps")] if not ok]
-        raise HTTPException(400,
-            f"'{file.filename}' is not valid Gherkin — it is missing {', '.join(missing)}. "
-            "Cucumber needs: Feature: <title>, then Scenario: <name>, then Given/When/Then steps. "
-            "If this is a solution/requirements document, a proper .feature must be written from it first.")
-
-    module = indexer.detect_module(text)
-    dest = config.UPLOADS_DIR / file.filename
-    dest.write_text(text, encoding="utf-8")
-
-    run_params = {
-        "url": url,
-        "maker_id": maker_id,
-        "maker_password": maker_password,
-        "checker_id": checker_id,
-        "checker_password": checker_password,
-    }
-    ai_ctx = None
-    if ai:
-        # identify the transaction from the filename first, then the content
-        m = indexer.TXN_RE.search(file.filename) or indexer.TXN_RE.search(text)
-        hit = indexer.lookup(m.group(1)) if m else None
-        ai_ctx = {"uploaded_text": text, "filename": file.filename,
-                  "hit": hit, "module": (hit or {}).get("module") or module}
-    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params,
-                             ai_ctx=ai_ctx)
-    closest = indexer.closest_feature(text, module)
-    return {
-        "module_detected": module,
-        "closest_existing_feature": closest,
-        "hint": "If the run reports undefined_steps, the framework has no Java glue "
-                "for those lines — reuse the closest_existing_feature's wording, "
-                "or generate new step definitions (phase 2).",
-        **job.public(),
-    }
-
-
-# ─────────────────────────── job status / logs ──────────────────────────────
-@app.get("/jobs/{job_id}/pending")
-def job_pending(job_id: str):
-    """The proposed changes for the in-browser review editor."""
-    job = executor.JOBS.get(job_id)
-    if not job or job.status != "review" or not job.pending:
-        raise HTTPException(404, "No changes awaiting review for this job.")
-    p = job.pending
-    hit = p.get("hit") or {}
-
-    old_feature_text = ""
-    if hit.get("feature"):
-        try:
-            old_feature_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            pass
-
-    old_files: dict[str, str | None] = {}
-    for rel in p["files"]:
-        f = config.JAVA_SRC_ROOT / rel
-        if f.exists():
-            try:
-                old_files[rel] = f.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                old_files[rel] = None
+    # expand wildcards like  lib/*  into real jar paths
+    expanded: list[str] = []
+    for e in entries:
+        if e.endswith("*"):
+            expanded.extend(glob.glob(e + ".jar") + glob.glob(e))
         else:
-            old_files[rel] = None  # brand-new file — every line is "added"
+            expanded.append(e)
 
-    return {
-        "feature_text": p["feature_text"], "files": p["files"], "meta": p["meta"],
-        "old_feature_text": old_feature_text, "old_files": old_files,
-        "match": {
-            "txn": hit.get("txn"), "module": hit.get("module"),
-            "confidence": p["meta"].get("matched_via_fallback_score"),  # None = direct/exact match
-            "is_new_feature": not bool(hit.get("feature")),
-        },
-    }
+    # recursive jar folders (Maven cache, nested lib dirs)
+    for d in getattr(config, "RECURSIVE_JAR_DIRS", []):
+        base = Path(d)
+        if base.is_dir():
+            expanded.extend(str(j) for j in base.rglob("*.jar"))
+
+    expanded = [e for e in dict.fromkeys(expanded) if Path(e).exists()]
+    flat = config.CP_SEP.join(expanded)
+    if len(flat) < 4000 and not any(Path(d).is_dir() for d in getattr(config, "RECURSIVE_JAR_DIRS", [])):
+        return flat
+
+    # build the pathing jar
+    urls = []
+    for e in expanded:
+        pth = Path(e).resolve()
+        u = "file:" + pathname2url(str(pth))
+        if pth.is_dir() and not u.endswith("/"):
+            u += "/"
+        urls.append(u)
+    raw = ("Manifest-Version: 1.0\r\nClass-Path: " + " ".join(urls) + "\r\n").encode("utf-8")
+    # manifest lines max 72 bytes; continuation lines start with one space
+    wrapped = bytearray()
+    line = bytearray()
+    for token in raw.split(b"\r\n"):
+        line = bytearray(token)
+        while len(line) > 70:
+            wrapped += line[:70] + b"\r\n"
+            line = bytearray(b" ") + line[70:]
+        wrapped += line + b"\r\n"
+    import zipfile
+    jar = config.DATA_DIR / "classpath.jar"
+    with zipfile.ZipFile(jar, "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", bytes(wrapped))
+    return str(jar)
 
 
-class Approval(BaseModel):
-    feature_text: str | None = None
-    files: dict[str, str] | None = None
+def _mask(cmd: list[str]) -> str:
+    return _SECRET_RE.sub(r"\1*****", " ".join(cmd))
 
 
-@app.post("/jobs/{job_id}/approve")
-def job_approve(job_id: str, body: Approval):
+def _patch_properties(run_params: dict | None) -> bytes | None:
+    """Write url / maker / checker into the framework's properties file.
+    Returns the ORIGINAL bytes so the caller can restore them afterwards."""
+    if not run_params or not any(run_params.get(f) for f in config.RUNTIME_PROPERTY_KEYS):
+        return None
+    pf = config.PROPERTIES_FILE
+    if not pf.exists():
+        return None
+    original = pf.read_bytes()
+    lines = original.decode("utf-8", errors="ignore").splitlines()
+    wanted = {key: run_params[fld]
+              for fld, key in config.RUNTIME_PROPERTY_KEYS.items()
+              if run_params.get(fld)}
+    out, seen = [], set()
+    for line in lines:
+        stripped = line.strip()
+        replaced = False
+        if stripped and not stripped.startswith(("#", "!")) and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in wanted:
+                out.append(f"{key}={wanted[key]}")
+                seen.add(key)
+                replaced = True
+        if not replaced:
+            out.append(line)
+    for key, val in wanted.items():          # keys not present yet -> append
+        if key not in seen:
+            out.append(f"{key}={val}")
+    pf.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return original
+
+
+@dataclass
+class Job:
+    id: str
+    feature_path: str
+    status: str = "queued"          # queued | running | passed | failed | error | stopped
+    return_code: int | None = None
+    log_file: Path = None
+    report_file: Path = None
+    summary: dict = field(default_factory=dict)
+    proc: object = None
+    stop_requested: bool = False
+    ai_ctx: dict | None = None
+    pending: dict | None = None          # proposed changes awaiting user review
+    run_params: dict | None = None
+    tag_filter: str | None = None
+
+    def public(self) -> dict:
+        return {
+            "job_id": self.id,
+            "feature": self.feature_path,
+            "status": self.status,
+            "return_code": self.return_code,
+            "summary": self.summary,
+            "needs_review": self.status == "review",
+        }
+
+
+def _capture_props(job) -> list[str]:
+    if not getattr(job, "capture", False):
+        return []
+    from . import runtime_capture
+    cap = runtime_capture.capture_dir_for(job.id)
+    cap.mkdir(parents=True, exist_ok=True)
+    return [f"-Dorchestrator.capture.dir={cap}", "-Dorchestrator.capture.all=true"]
+
+
+def _cucumber_props(feature_path: str, report_file: Path, dry_run: bool,
+                    run_params: dict | None, tag_filter: str | None = None) -> list[str]:
+    """System properties that OVERRIDE @CucumberOptions in TestRunner.java."""
+    if config.CUCUMBER_STYLE == "options":
+        # Cucumber 4.x: one combined option string
+        opts = f"{feature_path} --plugin json:{report_file}"
+        if dry_run:
+            opts += " --dry-run"
+        props = [f"-Dcucumber.options={opts}"]
+    else:
+        # Cucumber 5/6/7
+        props = [
+            f"-Dcucumber.features={feature_path}",
+            f"-Dcucumber.plugin=json:{report_file}",
+        ]
+        if dry_run:
+            props.append("-Dcucumber.execution.dry-run=true")
+    props.append(f"-D{config.BROWSER_SYSPROP}={config.BROWSER_VALUE}")
+    tag = tag_filter if tag_filter is not None else getattr(config, "CUCUMBER_TAG_FILTER", None)
+    if tag is not None:
+        if not tag.strip():
+            # An EMPTY value is ignored by some cucumber versions, letting the
+            # hardcoded tags="@400_pass" in TestRunner re-apply and filter
+            # everything out (Total tests run: 0). "not @<nonexistent>" is an
+            # explicit expression that matches every scenario.
+            tag = "not @__orchestrator_no_filter__"
+        props.append(f"-Dcucumber.filter.tags={tag}")
+    for k, v in getattr(config, "EXTRA_SYSTEM_PROPS", {}).items():
+        props.append(f"-D{k}={v}")
+    # Also expose url / maker / checker as system properties, in case
+    # PropertiesUtil checks System.getProperty() before the file.
+    for field, key in config.RUNTIME_PROPERTY_KEYS.items():
+        if run_params and run_params.get(field):
+            props.append(f"-D{key}={run_params[field]}")
+    return props
+
+
+def _build_command(feature_path: str, report_file: Path, dry_run: bool = False,
+                   run_params: dict | None = None, tag_filter: str | None = None) -> list[str]:
+    props = _cucumber_props(feature_path, report_file, dry_run, run_params, tag_filter)
+
+    if config.RUN_MODE == "java":
+        # No build tool: launch the already-compiled TestRunner directly.
+        # NOTE: -D properties must come BEFORE the main class.
+        base = [config.JAVA, *props, "-cp", _effective_classpath()]
+        if config.RUNNER_KIND == "testng":
+            return [*base, "org.testng.TestNG", "-testclass", config.TEST_RUNNER_CLASS]
+        return [*base, "org.junit.runner.JUnitCore", config.TEST_RUNNER_CLASS]
+
+    if config.RUN_MODE == "gradle":
+        return [
+            config.GRADLE, "test",
+            "--tests", config.TEST_RUNNER_CLASS,
+            *props,
+        ]
+
+    # maven
+    return [
+        config.MVN, "test",
+        f"-Dtest={config.TEST_RUNNER_CLASS}",
+        *props,
+        "-DfailIfNoTests=false",
+    ]
+
+
+def _parse_report(report_file: Path) -> dict:
+    """Turn cucumber's JSON report into a small pass/fail summary + undefined steps."""
+    if not report_file.exists():
+        return {}
     try:
-        job = executor.approve_job(job_id, body.feature_text, body.files)
-    except KeyError as e:
-        raise HTTPException(409, str(e))
-    except ValueError as e:
-        raise HTTPException(422, "Your edited java does not compile:\n" + str(e))
-    return job.public()
-
-
-@app.post("/jobs/{job_id}/discard")
-def job_discard(job_id: str):
-    if not executor.discard_job(job_id):
-        raise HTTPException(409, "Job is not awaiting review.")
-    return {"job_id": job_id, "status": "discarded"}
-
-
-@app.post("/jobs/{job_id}/stop")
-def stop_job(job_id: str):
-    ok = executor.stop_job(job_id)
-    if not ok:
-        raise HTTPException(409, "Job is not running (or unknown id).")
-    return {"job_id": job_id, "status": "stopping"}
-
-
-@app.get("/jobs/{job_id}")
-def job_status(job_id: str):
-    job = executor.JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Unknown job id.")
-    return job.public()
-
-
-@app.get("/jobs/{job_id}/logs")
-def job_logs(job_id: str, offset: int = 0):
-    chunk, new_offset = executor.read_log(job_id, offset)
-    job = executor.JOBS.get(job_id)
+        data = json.loads(report_file.read_text(errors="ignore"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    total = passed = failed = skipped = 0
+    undefined: list[str] = []
+    failures: list[dict] = []
+    scenarios: list[dict] = []
+    steps_passed = steps_failed = 0
+    for feat in data:
+        for el in feat.get("elements", []):
+            if el.get("type") == "background":
+                continue
+            total += 1
+            scenario_failed = False
+            duration_ns = 0
+            step_rows = []
+            for step in el.get("steps", []):
+                res = step.get("result", {})
+                st = res.get("status")
+                duration_ns += res.get("duration", 0) or 0
+                step_rows.append({
+                    "keyword": (step.get("keyword") or "").strip(),
+                    "name": step.get("name", ""),
+                    "status": st or "unknown",
+                    "duration_sec": round((res.get("duration", 0) or 0) / 1e9, 2),
+                    "error": (res.get("error_message") or "")[:2000],
+                })
+                if st == "passed":
+                    steps_passed += 1
+                if st == "undefined":
+                    undefined.append(step.get("name", ""))
+                if st in ("failed", "undefined"):
+                    scenario_failed = True
+                    steps_failed += 1
+                    if st == "failed":
+                        failures.append({
+                            "scenario": el.get("name"),
+                            "step": step.get("name"),
+                            "error": (res.get("error_message") or "")[:500],
+                        })
+                if st == "skipped":
+                    skipped += 1
+            if scenario_failed:
+                failed += 1
+            else:
+                passed += 1
+            scenarios.append({
+                "name": el.get("name") or "(unnamed scenario)",
+                "status": "failed" if scenario_failed else "passed",
+                "duration_sec": round(duration_ns / 1e9, 2),
+                "steps": step_rows,
+            })
     return {
-        "log": chunk,
-        "next_offset": new_offset,
-        "status": job.status if job else "unknown",
+        "scenarios_total": total,
+        "scenarios_passed": passed,
+        "scenarios_failed": failed,
+        "steps_passed": steps_passed,
+        "steps_failed": steps_failed,
+        "steps_skipped": skipped,
+        "scenarios": scenarios,
+        "undefined_steps": sorted(set(undefined)),
+        "failures": failures,
     }
 
 
-# ───────────────────────── serve the frontend ───────────────────────────────
-# Must be mounted LAST so it doesn't shadow the API routes above.
-# Open http://localhost:8000 in a browser after starting uvicorn.
-from pathlib import Path as _Path
-from fastapi.staticfiles import StaticFiles
+def _dry_run_sync(feature_path: str, log) -> list[str]:
+    """Run cucumber's dry-run (no browser) and return the undefined steps."""
+    rep = config.REPORTS_DIR / ("dry_" + uuid.uuid4().hex[:8] + ".json")
+    cmd = _build_command(feature_path, rep, dry_run=True)
+    log(">>> Phase 1/3 — dry run (no browser): checking which steps have java glue...")
+    r = subprocess.run(cmd, cwd=str(config.FRAMEWORK_ROOT),
+                       capture_output=True, text=True, timeout=600)
+    summary = _parse_report(rep)
+    und = summary.get("undefined_steps", [])
+    log(f">>> Dry run done: {len(und)} undefined step(s)" + (":" if und else "."))
+    for u in und:
+        log("      - " + u)
+    return und
 
-_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
-if _FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
+
+def _archive(paths: dict, txn_label: str, log) -> str:
+    """Copy the CURRENT versions of the given files into a permanent,
+    timestamped reference folder before they are modified."""
+    import shutil
+    from datetime import datetime
+    dest = config.ARCHIVE_DIR / txn_label / datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for kind, src in paths.items():
+        if src and Path(src).exists():
+            shutil.copy2(src, dest / Path(src).name)
+            log(f">>> Archived old {kind}: {Path(src).name}  ->  {dest}")
+    return str(dest)
+
+
+def _ai_prepare(job: Job, log) -> str | None:
+    """Compare + normalize + merge + generate + compile-verify, then STOP for
+    user review. Returns a feature path to run immediately when nothing
+    changed, or None when job.pending was filled and approval is required.
+
+    Integrates Phases 6-9 (feature_matcher, feature_normalizer, merge_engine,
+    feature_comparator) into the live pipeline:
+      - feature_matcher is used ONLY as a FALLBACK — it never overrides an
+        existing hit found by the simple filename/content txn lookup (main.py),
+        it only fires when that lookup found NOTHING. This means the path that
+        already worked cannot regress; the new capability (finding a likely
+        existing feature even without a clean txn number) is strictly additive.
+        A higher confidence threshold (0.25) is used here than the module's
+        general-purpose default, because a wrong match here means committing
+        to the wrong framework file — mitigated further by the mandatory
+        human review gate downstream, which shows the match score.
+      - feature_normalizer runs BEFORE the dry-run (not after), so wording/tag
+        fixes are reflected in an ACCURATE undefined-steps count. Running the
+        dry-run on the raw upload (the old order) would wrongly flag a step
+        that's really just typo'd/differently-phrased as "undefined" and send
+        it to the LLM to regenerate as an unwanted duplicate.
+      - merge_engine replaces the old text-block merge, adding visibility into
+        scenarios present in the existing feature but untouched by this
+        upload (never deleted, only reported).
+      - feature_comparator supplies a richer summary for job.pending["meta"]
+        (additive keys only — the three original keys/semantics the frontend
+        already reads are unchanged, so the existing review screen keeps
+        working without modification).
+    """
+    from . import generator, feature_matcher, feature_normalizer, merge_engine, feature_comparator, indexer
+
+    ctx = job.ai_ctx
+    hit = ctx.get("hit") or {}
+    uploaded = ctx["uploaded_text"]
+    filename = ctx.get("filename")
+    module_hint = ctx.get("module")
+
+    match = None
+    if not hit:
+        # The simple filename/content txn lookup (main.py) found nothing —
+        # try the smarter multi-signal matcher as a fallback ONLY (never as
+        # an override of an already-found hit).
+        try:
+            match = feature_matcher.best_match(uploaded, filename, module_hint, min_score=0.25)
+        except Exception as e:  # noqa: BLE001 — matching is best-effort, never fatal
+            log(f">>> Feature matching unavailable ({e}).")
+        if match:
+            matched_hit = indexer.lookup(match["txn"]) if match.get("txn") else None
+            if matched_hit:
+                hit = matched_hit
+                log(f">>> No exact transaction number found in the upload, but matching found a "
+                   f"likely existing feature: {hit['txn']} (module={hit['module']}, "
+                   f"confidence={match['score']}). Using it as the comparison baseline.")
+
+    old_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore") if hit.get("feature") else ""
+
+    try:
+        norm = feature_normalizer.normalize_feature(uploaded, old_text)
+        normalized_text, norm_changes = norm["normalized_text"], norm["changes"]
+        s = norm["summary"]
+        log(f">>> Normalization: {s['tags_normalized']} tag(s), {s['steps_normalized']} step(s), "
+           f"{s['scenarios_renamed']} scenario name(s) aligned to framework conventions.")
+    except Exception as e:  # noqa: BLE001 — normalization is best-effort, never fatal
+        log(f">>> Normalization unavailable ({e}); using the upload as-is.")
+        normalized_text, norm_changes = uploaded, {}
+
+    # dry-run the NORMALIZED text via a sibling temp file — the accurate
+    # undefined-steps count reflects the wording/tag fixes above.
+    norm_path = str(Path(job.feature_path).with_name(Path(job.feature_path).stem + "__normalized.feature"))
+    Path(norm_path).write_text(normalized_text, encoding="utf-8")
+    try:
+        undefined = _dry_run_sync(norm_path, log)
+    finally:
+        Path(norm_path).unlink(missing_ok=True)
+
+    merge_result = merge_engine.merge(old_text, normalized_text)
+    added, replaced, unreferenced = (merge_result["appended_scenarios"],
+                                     merge_result["replaced_scenarios"],
+                                     merge_result["unreferenced_scenarios"])
+    log(f">>> Merge: {len(added)} new scenario(s) {added or ''}, "
+       f"{len(replaced)} changed scenario(s) {replaced or ''}, "
+       f"{len(unreferenced)} existing scenario(s) untouched by this upload {unreferenced or ''} "
+       f"(kept, not deleted).")
+    merged = merge_result["merged_text"]
+
+    if not undefined and not added and not replaced and old_text:
+        # Nothing to do — run the REAL existing framework file directly
+        # (not the raw/possibly-typo'd upload: the dry-run above only proved
+        # the NORMALIZED wording has glue, not necessarily the raw upload's).
+        log(">>> No differences and all steps defined — executing the existing framework feature as-is.")
+        return hit["feature"]
+
+    comparison_summary = None
+    try:
+        comparison_summary = feature_comparator.compare_features(old_text, normalized_text)["summary"]
+    except Exception:  # noqa: BLE001 — comparison summary is a nice-to-have only
+        pass
+
+    # ── Locator Discovery Gate (spec: mandatory before code generation) ──
+    from . import locator_gate
+    txn_for_locators = (hit or {}).get("txn") or ctx.get("txn")
+    gate = locator_gate.evaluate(undefined, txn_for_locators, module_hint)
+    if gate["ui_steps"]:
+        log(f">>> Locator gate ({gate['policy']}): {gate['message']}")
+    if gate["blocked"]:
+        job.status = "locator_required"
+        job.summary = {
+            "error": gate["message"],
+            "locator_required": True,
+            "unresolved_steps": gate["unresolved_steps"],
+            "ui_steps": gate["ui_steps"],
+        }
+        _log_error(job, gate["message"] + " Unresolved: " + "; ".join(gate["unresolved_steps"]))
+        return None
+
+    gen_files = {}
+    if undefined:
+        log(">>> Generating framework updates with Azure OpenAI...")
+        gen_files, _ = generator.generate_and_compile(
+            {**ctx, "hit": hit, "uploaded_text": normalized_text}, undefined,
+            _effective_classpath(), config.GEN_DIR / job.id, log)
+
+    job.pending = {
+        "feature_text": merged,
+        "files": gen_files,
+        "meta": {
+            # unchanged keys/semantics — the existing review screen keeps working as-is
+            "undefined_steps": undefined, "scenarios_added": added, "scenarios_replaced": replaced,
+            # new, additive keys for a future review-screen upgrade
+            "scenarios_unreferenced": unreferenced, "normalization": norm_changes,
+            "matched_via_fallback_score": match["score"] if match else None,
+            "comparison_summary": comparison_summary,
+        },
+        "txn_label": hit.get("txn") or Path(ctx.get("filename", "feature")).stem,
+        "hit": hit, "module": ctx.get("module"), "filename": ctx.get("filename"),
+    }
+    log(">>> Changes are ready for REVIEW — edit or approve them in the browser to continue.")
+    return None
+
+
+def _commit_pending(job: Job, log):
+    """Archive current versions, then write the (possibly user-edited)
+    feature + java into the framework and compile the java."""
+    from . import indexer
+    pen = job.pending
+    hit = pen["hit"]
+
+    to_archive = {"feature": hit.get("feature")}
+    for rel in pen["files"]:
+        tgt = config.JAVA_SRC_ROOT / rel
+        if tgt.exists():
+            to_archive[Path(rel).name] = str(tgt)
+    if hit.get("page"):
+        to_archive.setdefault("page", hit["page"])
+    if hit.get("steps"):
+        to_archive.setdefault("steps", hit["steps"])
+    archive_dir = _archive(to_archive, pen["txn_label"], log)
+
+    if hit.get("feature"):
+        feature_target = Path(hit["feature"])
+    else:
+        module = pen.get("module") or "common"
+        feature_target = config.FEATURES_DIR / module / (pen.get("filename") or (pen["txn_label"] + ".feature"))
+        feature_target.parent.mkdir(parents=True, exist_ok=True)
+    feature_target.write_text(pen["feature_text"], encoding="utf-8")
+    log(f">>> Updated feature file: {feature_target}")
+
+    for rel, code in pen["files"].items():
+        tgt = config.JAVA_SRC_ROOT / rel
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        tgt.write_text(code, encoding="utf-8")
+        log(f">>> Updated java source: {tgt}")
+    if pen["files"]:
+        srcs = [str(config.JAVA_SRC_ROOT / rel) for rel in pen["files"]]
+        config.TEST_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
+        rc = subprocess.run([config.JAVAC, "-encoding", "UTF-8",
+                             "-cp", _effective_classpath(),
+                             "-d", str(config.TEST_CLASSES_DIR), *srcs],
+                            capture_output=True, text=True, timeout=300)
+        if rc.returncode != 0:
+            raise RuntimeError("commit compile failed:\n" + (rc.stdout + rc.stderr)[:1500])
+        log(">>> Compiled updated classes into target/test-classes")
+
+    job.summary["ai"] = {**pen["meta"],
+                         "java_files_updated": list(pen["files"].keys()),
+                         "archive": archive_dir}
+    indexer.build_index()
+    return str(feature_target)
+
+
+def _execute(job: Job, log_mode: str = "w", dry_run: bool = False):
+    """Launch the JVM for job.feature_path, stream to the log, parse the report."""
+    original_props = None
+    try:
+        with _RUN_LOCK:
+            original_props = _patch_properties(job.run_params)
+            try:
+                with open(job.log_file, log_mode, encoding="utf-8", errors="ignore") as log:
+                    cmd = _build_command(job.feature_path, job.report_file,
+                                         dry_run, job.run_params, job.tag_filter)
+                    log.write("\n>>> " + _mask(cmd) + "\n\n")   # never log passwords
+                    log.flush()
+                    proc = subprocess.Popen(cmd, cwd=str(config.FRAMEWORK_ROOT),
+                                            stdout=log, stderr=subprocess.STDOUT, shell=False)
+                    job.proc = proc
+                    job.return_code = proc.wait()
+            finally:
+                if original_props is not None:
+                    config.PROPERTIES_FILE.write_bytes(original_props)
+        _ai_info = job.summary.get("ai")
+        job.summary = _parse_report(job.report_file)
+        if _ai_info:
+            job.summary["ai"] = _ai_info
+        if job.stop_requested:
+            job.status = "stopped"
+            return
+        if job.summary.get("scenarios_total", 0) == 0:
+            job.status = "failed"
+            job.summary["error"] = ("Cucumber found 0 scenarios in this feature. The file is "
+                "probably not valid Gherkin (check for a missing 'Feature:' header, prose text, "
+                "or Word formatting), or every scenario was filtered out. Scroll up in the "
+                "console for gherkin parse errors.")
+            return
+        if job.summary.get("undefined_steps"):
+            job.status = "failed"
+        elif job.return_code == 0 and job.summary.get("scenarios_failed", 0) == 0:
+            job.status = "passed"
+        else:
+            job.status = "failed"
+    except FileNotFoundError as e:
+        job.status = "error"
+        job.summary = {"error": f"Could not start the launcher ({e}). Check JAVA_CMD/MVN_CMD and PATH."}
+    except Exception as e:  # noqa: BLE001
+        job.status = "error"
+        job.summary = {"error": str(e)}
+        _log_error(job, str(e))
+
+
+def _log_error(job: Job, msg: str):
+    try:
+        with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+            f.write("\n>>> ERROR: " + msg + "\n")
+    except OSError:
+        pass
+
+
+def _run(job: Job, dry_run: bool, run_params: dict | None, tag_filter: str | None = None):
+    job.status = "running"
+    job.run_params, job.tag_filter = run_params, tag_filter
+    if not job.ai_ctx:
+        _execute(job, "w", dry_run)
+        return
+    # AI flow: prepare (dry-run + merge + generate) -> pause for review
+    try:
+        with _RUN_LOCK:
+            with open(job.log_file, "w", encoding="utf-8", errors="ignore") as log:
+                def L(m):
+                    log.write(m + "\n"); log.flush()
+                run_now = _ai_prepare(job, L)
+        if run_now is not None:            # nothing changed -> straight to execution
+            job.feature_path = run_now
+            _execute(job, "a")
+        elif job.status == "locator_required":
+            pass                            # gate halted before generation; status already set
+        else:
+            policy = getattr(config, "AUTO_APPROVE_POLICY", "never")
+            pending_blob = (job.pending.get("feature_text", "") +
+                            "".join(job.pending.get("files", {}).values()))
+            has_todos = "TODO QA" in pending_blob or "TODO:" in pending_blob
+            if policy == "always" or (policy == "no_todos" and not has_todos):
+                _log_error  # noqa: B018 — keep symbol referenced for clarity
+                with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"\n>>> AUTO-APPROVE (policy: {policy}"
+                            f"{', no TODO markers found' if policy == 'no_todos' else ''}) — "
+                            "committing without human review (CI mode)...\n")
+                _finalize(job)
+            else:
+                if policy == "no_todos" and has_todos:
+                    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                        f.write("\n>>> AUTO-APPROVE withheld: generated code contains TODO locator "
+                                "markers — pausing for human review (policy: no_todos).\n")
+                job.status = "review"          # frontend shows the editor; approval resumes
+    except Exception as e:  # noqa: BLE001
+        job.status = "error"
+        job.summary = {"error": str(e)}
+        _log_error(job, str(e))
+
+
+def _finalize(job: Job):
+    """Runs after user approval: commit the (edited) changes, then execute."""
+    job.status = "running"
+    try:
+        with _RUN_LOCK:
+            with open(job.log_file, "a", encoding="utf-8", errors="ignore") as log:
+                def L(m):
+                    log.write(m + "\n"); log.flush()
+                L("\n>>> Changes APPROVED by user — committing to the framework...")
+                job.feature_path = _commit_pending(job, L)
+        _execute(job, "a")
+    except Exception as e:  # noqa: BLE001
+        job.status = "error"
+        job.summary = {"error": str(e)}
+        _log_error(job, str(e))
+
+
+def heal_job(job_id: str) -> Job:
+    """Self-healing (capture-mode runs): feed the FAILED screen's captured DOM
+    + the failing steps' errors + existing page/steps java to Azure, get
+    repaired locator/page code, and route it through the SAME pending ->
+    approve machinery as any AI change. AUTO_APPROVE_POLICY applies: under
+    no_todos/always a clean repair auto-commits and RE-RUNS; under never it
+    pauses in the review screen like any other change."""
+    from . import generator, runtime_capture
+    job = JOBS.get(job_id)
+    if not job or job.status != "failed":
+        raise KeyError("Healing needs a FAILED job.")
+    evidence = runtime_capture.failing_evidence(job.id)
+    if not evidence:
+        raise KeyError("No runtime captures for this job - re-run it in Capture Mode first.")
+    failed_steps = [f'{st.get("keyword", "")}{st.get("name", "")}: {st.get("error", "")[:400]}'
+                    for sc in job.summary.get("detail", []) for st in sc.get("steps", [])
+                    if st.get("status") == "failed"]
+    ctx = job.ai_ctx or {"uploaded_text": Path(job.feature_path).read_text(encoding="utf-8", errors="ignore"),
+                         "filename": Path(job.feature_path).name,
+                         "hit": None, "module": None}
+    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+        f.write("\n>>> SELF-HEAL: analysing captured DOM of the failed screen "
+                f"({evidence['checkpoint']}) with Azure OpenAI...\n")
+    heal_prompt = f"""A Selenium test failed. Repair ONLY the broken locator(s)/page code.
+
+## FAILED STEPS AND ERRORS:
+{chr(10).join(failed_steps) or '(see report)'}
+
+## ACTUAL HTML OF THE SCREEN AT FAILURE (captured live - the locator you produce
+## MUST exist in this HTML; never invent attributes not present here):
+```html
+{evidence['html']}
+```
+
+Return the corrected complete file(s) in the ===FILE/===END format."""
+    files, _ = generator.generate_and_compile(
+        ctx, [], _effective_classpath(), config.GEN_DIR / job.id / "heal",
+        lambda m: open(job.log_file, "a", encoding="utf-8", errors="ignore").write(m + "\n"),
+        extra_user_context=heal_prompt)
+    job.pending = {"feature_text": Path(job.feature_path).read_text(encoding="utf-8", errors="ignore"),
+                   "files": files, "hit": ctx.get("hit"),
+                   "meta": {"healing": True, "undefined_steps": [],
+                            "scenarios_added": [], "scenarios_replaced": [],
+                            "checkpoint": evidence["checkpoint"]}}
+    policy = getattr(config, "AUTO_APPROVE_POLICY", "never")
+    blob = "".join(files.values())
+    if policy == "always" or (policy == "no_todos" and "TODO QA" not in blob and "TODO:" not in blob):
+        with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+            f.write(f">>> SELF-HEAL: auto-approving repair (policy: {policy}) and re-running...\n")
+        job.status = "review"
+        return approve_job(job.id, None, None)
+    job.status = "review"
+    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
+        f.write(">>> SELF-HEAL: repair ready - review and approve in the browser to re-run.\n")
+    return job
+
+
+def approve_job(job_id: str, feature_text: str | None, files: dict | None) -> Job:
+    """Accept (possibly edited) changes. Edited java is compile-checked in
+    quarantine first; compile errors raise ValueError and the job STAYS in review."""
+    from . import generator
+    job = JOBS.get(job_id)
+    if not job or job.status != "review" or not job.pending:
+        raise KeyError("Job is not awaiting review.")
+    if feature_text is not None:
+        job.pending["feature_text"] = feature_text
+    if files:
+        merged_files = dict(job.pending["files"])
+        merged_files.update({k: v for k, v in files.items() if v and v.strip()})
+        ok, err, _ = generator._compile(merged_files, config.GEN_DIR / job.id / "approved",
+                                        _effective_classpath())
+        if not ok:
+            raise ValueError(err[:2000])
+        job.pending["files"] = merged_files
+    threading.Thread(target=_finalize, args=(job,), daemon=True).start()
+    return job
+
+
+def discard_job(job_id: str) -> bool:
+    job = JOBS.get(job_id)
+    if not job or job.status != "review":
+        return False
+    job.status = "discarded"
+    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as log:
+        log.write("\n>>> Changes DISCARDED by user. The framework was not modified.\n")
+    job.pending = None
+    return True
+
+
+def start_job(feature_path: str, dry_run: bool = False, capture: bool = False,
+              run_params: dict | None = None, tag_filter: str | None = None,
+              ai_ctx: dict | None = None) -> Job:
+    job_id = uuid.uuid4().hex[:12]
+    job = Job(
+        id=job_id,
+        feature_path=str(feature_path),
+        log_file=config.LOGS_DIR / f"{job_id}.log",
+        report_file=config.REPORTS_DIR / f"{job_id}.json",
+        ai_ctx=ai_ctx,
+    )
+    job.run_params, job.tag_filter = run_params, tag_filter
+    JOBS[job_id] = job
+    threading.Thread(target=_run, args=(job, dry_run, run_params, tag_filter), daemon=True).start()
+    return job
+
+
+def stop_job(job_id: str) -> bool:
+    """Kill a running execution (java + its Edge/driver children)."""
+    job = JOBS.get(job_id)
+    if not job or job.status != "running" or job.proc is None:
+        return False
+    job.stop_requested = True
+    try:
+        if os.name == "nt":
+            # /T kills the whole tree: java -> msedgedriver -> Edge
+            subprocess.run(["taskkill", "/PID", str(job.proc.pid), "/T", "/F"],
+                           capture_output=True)
+        else:
+            job.proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def read_log(job_id: str, offset: int = 0) -> tuple[str, int]:
+    """Return log text from byte offset, plus the new offset (for live polling)."""
+    job = JOBS.get(job_id)
+    if not job or not job.log_file.exists():
+        return "", offset
+    with open(job.log_file, "r", encoding="utf-8", errors="ignore") as f:
+        f.seek(offset)
+        chunk = f.read()
+        return chunk, f.tell()
