@@ -1,153 +1,67 @@
-"""
-Live Browser Capture Mode — Python side.
+package com.nbc.stepDefinitions.common;
 
-The Java framework does ALL navigation (login, menus, opening transactions —
-the things it is already validated to do), then at configured checkpoints POSTs
-a runtime capture to this module: screenshot + HTML + metadata for the screen
-it just reached. We store each capture under
-data/runtime_capture/<run>/<txn>/<checkpoint>/ and expose it to the AI locator
-generator, so when new automation is generated the model reasons over the REAL
-DOM the framework actually saw — not a guess.
+import io.cucumber.java.AfterStep;
+import io.cucumber.java.Scenario;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
+import org.openqa.selenium.WebDriver;
 
-Design rule from the spec, enforced here: the AI never navigates. This module
-only RECEIVES captures the framework pushes; it never drives a browser itself.
-(That is the recorder's separate, human-driven job.) This cleanly sidesteps
-the "navigate to the correct screen" problem — the framework already solved it.
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
-Screenshots are stored as-is (they are of the app UI, needed for vision later);
-HTML is stored but SANITIZED of obvious input values before persisting, so a
-captured page can't leak a typed account number or password to disk.
-"""
-import base64
-import json
-import re
-import time
-from pathlib import Path
+/**
+ * ORCHESTRATOR CAPTURE HOOK — install ONCE, then never touch again.
+ *
+ * Completely inert during normal runs: only activates when the orchestrator
+ * launches java with -Dorchestrator.capture.dir=<folder>. Captures screenshot
+ * + full HTML + metadata after every step (or failures only, if
+ * -Dorchestrator.capture.all=false), into that folder — the runtime evidence
+ * the AI uses for locator discovery and self-healing.
+ *
+ * INSTALL (one manual edit, marked below):
+ * 1. Save this file as src/test/java/com/nbc/stepDefinitions/common/OrchestratorCaptureHook.java
+ * 2. Fix the ONE line marked TODO to use YOUR framework's driver accessor —
+ *    open CommonSteps.java and copy however IT gets the WebDriver
+ *    (e.g. BaseTest.getDriver() / DriverFactory.getDriver() / a shared field).
+ * 3. Ctrl+F9 (Build Project). Done — normal runs are unaffected.
+ */
+public class OrchestratorCaptureHook {
 
-from . import config
+    private static int counter = 0;
 
-# strip value="..." from inputs and text between form fields — best-effort PII guard
-_VALUE_ATTR = re.compile(r'(<input\b[^>]*?\bvalue=)"[^"]*"', re.I)
-_PWD_BLOCK = re.compile(r'(<input\b[^>]*\btype="password"[^>]*)value="[^"]*"', re.I)
-
-
-def _sanitize_html(html: str) -> str:
-    html = _PWD_BLOCK.sub(r'\1value="[REDACTED]"', html)
-    html = _VALUE_ATTR.sub(r'\1"[REDACTED]"', html)
-    return html
-
-
-def _canon_txn(txn: str | None) -> str:
-    if not txn:
-        return "unknown"
-    digits = re.sub(r"\D", "", str(txn))
-    return ("Txn" + digits.lstrip("0")) if digits else "unknown"
-
-
-def _capture_root() -> Path:
-    d = config.DATA_DIR / "runtime_capture"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def store_capture(run_id: str, txn: str | None, checkpoint: str,
-                  html: str = "", screenshot_b64: str = "",
-                  metadata: dict | None = None) -> dict:
-    """Persist one runtime capture. Returns a small summary (never the full
-    payload). Called by the ingestion endpoint the Java framework POSTs to."""
-    run = re.sub(r"[^\w.-]", "_", run_id or time.strftime("%Y%m%d_%H%M%S"))
-    txn_c = _canon_txn(txn)
-    cp = re.sub(r"[^\w.-]", "_", checkpoint or "screen")
-    folder = _capture_root() / run / txn_c / cp
-    folder.mkdir(parents=True, exist_ok=True)
-
-    saved = {"html": False, "screenshot": False}
-    if html:
-        (folder / "page.html").write_text(_sanitize_html(html), encoding="utf-8", errors="ignore")
-        saved["html"] = True
-    if screenshot_b64:
-        try:
-            (folder / "screenshot.png").write_bytes(base64.b64decode(screenshot_b64))
-            saved["screenshot"] = True
-        except Exception:  # noqa: BLE001 — bad base64 shouldn't fail the whole capture
-            pass
-
-    meta = dict(metadata or {})
-    meta.update({"run_id": run, "txn": txn_c, "checkpoint": cp,
-                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                 "saved": saved})
-    (folder / "metadata.json").write_text(json.dumps(meta, indent=1))
-    return {"stored": True, "path": str(folder), "txn": txn_c,
-            "checkpoint": cp, "saved": saved}
-
-
-def list_captures(run_id: str | None = None, txn: str | None = None) -> list[dict]:
-    root = _capture_root()
-    out = []
-    for meta_file in root.rglob("metadata.json"):
-        try:
-            m = json.loads(meta_file.read_text())
-        except Exception:  # noqa: BLE001
-            continue
-        if run_id and m.get("run_id") != run_id:
-            continue
-        if txn and _canon_txn(txn) != m.get("txn"):
-            continue
-        m["folder"] = str(meta_file.parent)
-        out.append(m)
-    return sorted(out, key=lambda m: m.get("timestamp", ""), reverse=True)
-
-
-def latest_capture_for(txn: str | None, checkpoint: str | None = None) -> dict | None:
-    """The most recent capture for a transaction (optionally a specific
-    checkpoint), used to feed the AI real runtime DOM when generating."""
-    caps = list_captures(txn=txn)
-    if checkpoint:
-        caps = [c for c in caps if c.get("checkpoint") == re.sub(r"[^\w.-]", "_", checkpoint)]
-    return caps[0] if caps else None
-
-
-def runtime_dom_for_prompt(txn: str | None, cap_chars: int = 6000) -> str:
-    """Trimmed runtime HTML for the latest capture of a txn, formatted for the
-    AI generation prompt. Empty string if nothing captured yet (generation
-    still proceeds, just without runtime context)."""
-    cap = latest_capture_for(txn)
-    if not cap:
-        return ""
-    html_file = Path(cap["folder"]) / "page.html"
-    if not html_file.exists():
-        return ""
-    html = html_file.read_text(encoding="utf-8", errors="ignore")
-    # keep the interactive skeleton: tags with id/name/placeholder/aria/type/text
-    interesting = re.findall(
-        r'<(?:input|button|select|textarea|a|td|th|label|option)\b[^>]*>',
-        html, re.I)
-    skeleton = "\n".join(interesting[:400])
-    body = skeleton or html
-    meta_line = (f'[runtime capture: screen="{cap.get("screen_name", cap.get("checkpoint"))}" '
-                 f'url="{cap.get("url", "?")}" title="{cap.get("title", "?")}"]')
-    return (meta_line + "\n" + body)[:cap_chars]
-
-
-# ─────────────── Screen Knowledge Repository (spec section) ───────────────────
-def _screen_repo_file() -> Path:
-    return config.DATA_DIR / "screen_repository.json"
-
-
-def load_screen_repository() -> list[dict]:
-    f = _screen_repo_file()
-    return json.loads(f.read_text()) if f.exists() else []
-
-
-def record_screen(entry: dict) -> int:
-    """After a successful run, record which screens were captured for which
-    txn so future generations can reuse them before any new capture."""
-    repo = load_screen_repository()
-    key = (entry.get("txn"), entry.get("screen_name"), entry.get("checkpoint"))
-    existing = {(e.get("txn"), e.get("screen_name"), e.get("checkpoint")) for e in repo}
-    if key in existing:
-        return 0
-    entry.setdefault("recorded_at", time.strftime("%Y-%m-%d %H:%M:%S"))
-    repo.append(entry)
-    _screen_repo_file().write_text(json.dumps(repo, indent=1))
-    return 1
+    @AfterStep
+    public void captureAfterStep(Scenario scenario) {
+        String dir = System.getProperty("orchestrator.capture.dir", "");
+        if (dir.isEmpty()) return;                                     // normal run: inert
+        boolean all = Boolean.parseBoolean(System.getProperty("orchestrator.capture.all", "true"));
+        if (!all && !scenario.isFailed()) return;                      // failures-only mode
+        try {
+            // ── TODO (the ONE line to adapt): your framework's driver accessor ──
+            WebDriver driver = com.nbc.base.BaseTest.getDriver();
+            // ────────────────────────────────────────────────────────────────────
+            if (driver == null) return;
+            counter++;
+            String safe = scenario.getName().replaceAll("[^A-Za-z0-9]+", "_");
+            if (safe.length() > 60) safe = safe.substring(0, 60);
+            Path folder = Paths.get(dir, String.format("%03d_%s%s", counter, safe,
+                    scenario.isFailed() ? "_FAILED" : ""));
+            Files.createDirectories(folder);
+            Files.write(folder.resolve("page.html"),
+                    driver.getPageSource().getBytes(StandardCharsets.UTF_8));
+            try {
+                byte[] png = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
+                Files.write(folder.resolve("screenshot.png"), png);
+            } catch (Exception ignored) { }
+            String meta = String.format(
+                    "{\"scenario\":\"%s\",\"failed\":%s,\"url\":\"%s\",\"title\":\"%s\",\"ts\":%d}",
+                    scenario.getName().replace("\"", "'"), scenario.isFailed(),
+                    driver.getCurrentUrl().replace("\"", "'"),
+                    driver.getTitle().replace("\"", "'"), System.currentTimeMillis());
+            Files.write(folder.resolve("meta.json"), meta.getBytes(StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+            // capture must NEVER break a test run
+        }
+    }
+}
