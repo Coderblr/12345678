@@ -1,119 +1,621 @@
 """
-Locator Discovery Gate (spec: locator resolution is MANDATORY before code
-generation; under strict policy, halt if locators can't be found).
+FastAPI orchestrator for the Java Cucumber framework.
 
-This does NOT itself find element-level locators for arbitrary steps — that is
-what generation + the repository + capture do. Its job is the GATE decision:
-given the new/undefined steps that will need Java, decide whether the framework
-already has enough locator knowledge to implement them WITHOUT inventing
-guesses, and if not, stop and report exactly what's missing.
+Flow 1 (manager's primary flow):
+    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
 
-Resolution sources checked, in order (all already built):
-  1. Locator repository (recorder-captured, human-verified locators)
-  2. Runtime capture DOM for this txn (Capture Mode)
-  3. Existing page-object locators for the txn's module (framework_scanner)
+Flow 2 (alternate flow):
+    POST /execute/upload            -> user uploads a .feature file; we detect its module,
+                                       dry-run to verify glue code exists, then execute it
 
-A step is considered "UI-interacting" (needs a locator) if its wording implies
-a screen action — click/enter/select/verify-on-screen etc. Pure navigation or
-data-setup steps that reuse existing glue don't need new locators.
+Common:
+    GET  /jobs/{job_id}             -> status + pass/fail summary
+    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
+    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
+    POST /index/rebuild             -> rescan the framework after new features are added
+
+Run with:  uvicorn app.main:app --reload --port 8000
 """
 import re
 
-from . import config
+from pathlib import Path
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# words that imply the step touches a UI element (needs a locator)
-_UI_VERBS = re.compile(
-    r"\b(click|enter|select|type|choose|check|uncheck|tick|upload|input|fill|"
-    r"press|toggle|set|search|view|see|verify|validate|confirm|display|"
-    r"dropdown|button|field|screen|tile|checkbox|radio|link|tab|menu)\b", re.I)
-
-# steps that are clearly NOT new UI interactions (login/logout/navigation that
-# reuse existing common glue) — never block on these
-_NON_UI = re.compile(r"\b(logged in|log out|logout|logs? in|navigat|home screen|"
-                    r"is initiated|reviewing|parameters)\b", re.I)
+from . import config, executor, indexer, knowledge, framework_scanner, feature_matcher, feature_comparator, feature_normalizer, merge_engine, knowledge_graph, brd_processor, recorder, capture, runtime_capture
 
 
-def _needs_locator(step_text: str) -> bool:
-    if _NON_UI.search(step_text):
-        return False
-    return bool(_UI_VERBS.search(step_text))
+class RunParams(BaseModel):
+    """Target environment + credentials for one execution.
+    All optional — omit any value to keep whatever the properties file already has."""
+    url: str | None = None
+    maker_id: str | None = None
+    maker_password: str | None = None
+    checker_id: str | None = None
+    checker_password: str | None = None
+
+app = FastAPI(title="Java Framework Orchestrator")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # your Next.js dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def _resolution_sources(txn: str | None, module: str | None) -> dict:
-    """Everything the framework currently knows that could supply a locator."""
-    facts = {"repository": "", "runtime_dom": "", "page_locators": ""}
+@app.on_event("startup")
+def _startup():
+    if config.FRAMEWORK_ROOT.exists():
+        indexer.build_index()
+        try:
+            knowledge.build_knowledge()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ─────────────────────────── index endpoints ────────────────────────────────
+@app.post("/index/rebuild")
+def rebuild_index():
+    idx = indexer.build_index()
+    return {"indexed_txns": len(idx)}
+
+
+@app.post("/knowledge/rebuild")
+def rebuild_knowledge(embed: bool = False):
+    """Rescan the WHOLE framework into the AI knowledge base. With ?embed=1,
+    also (re)build the RAG embeddings via Azure (needs an embedding deployment)."""
+    kb = knowledge.build_knowledge()
+    stats = dict(kb["stats"])
+    if embed:
+        stats.update(knowledge.build_embeddings())
+    stats["rag_embeddings"] = knowledge.embeddings_available()
+    return stats
+
+
+@app.get("/knowledge/stats")
+def knowledge_stats():
+    stats = dict(knowledge.get_knowledge()["stats"])
+    stats["rag_embeddings"] = knowledge.embeddings_available()
+    return stats
+
+
+# ═══════════════ Phase 1 — Framework Scanner (additive, new) ═══════════════
+# Separate from /knowledge/* (app/knowledge.py), which continues to power the
+# existing AI-generation RAG exactly as before. These endpoints expose the
+# richer, feature/scenario-level scan for future phases (matching, comparison,
+# normalization) and for direct browsing/search.
+@app.post("/framework/scan")
+def framework_scan():
+    kb = framework_scanner.scan_framework()
+    return kb["stats"]
+
+
+@app.get("/framework/stats")
+def framework_stats():
+    return framework_scanner.get_framework_knowledge()["stats"]
+
+
+@app.get("/framework/features/search")
+def framework_search(q: str, limit: int = 20):
+    return {"results": framework_scanner.search_features(q, limit)}
+
+
+# ═══════════════ Phase 6 — Intelligent Feature Matching (additive, new) ═════
+class MatchRequest(BaseModel):
+    text: str
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+    top_k: int = 5
+
+
+@app.post("/framework/match")
+def framework_match(body: MatchRequest):
+    """Rank every framework feature against the given text — five signals
+    (txn/module/tags/scenario-lexical/semantic). Standalone + testable; not
+    yet wired into /execute/upload (that comes with Phase 7 Comparison)."""
+    return {"matches": feature_matcher.find_matches(
+        body.text, body.filename, body.module_hint, body.txn_hint, body.top_k)}
+
+
+@app.post("/framework/embeddings/rebuild")
+def framework_embeddings_rebuild():
+    """Embed every feature (name + scenario names) for the semantic_similarity
+    signal in /framework/match. Requires AZURE_OPENAI_EMBED_DEPLOYMENT."""
+    return feature_matcher.build_feature_embeddings()
+
+
+# ═══════════════ Phase 7 — Intelligent Feature Comparison (additive, new) ══
+class CompareRequest(BaseModel):
+    uploaded_text: str
+    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+
+
+@app.post("/framework/compare")
+def framework_compare(body: CompareRequest):
+    """Structured diff: unchanged / new / deleted / modified scenarios, with
+    step-level, Examples-level, and data-table-level detail for each modified
+    scenario. If existing_text is omitted, the best match is found
+    automatically (Phase 6). Not yet wired into /execute/upload."""
     try:
-        from . import recorder
-        facts["repository"] = recorder.repository_for_prompt()
-    except Exception:  # noqa: BLE001
-        pass
+        if body.existing_text is not None:
+            return feature_comparator.compare_features(body.existing_text, body.uploaded_text)
+        return feature_comparator.compare_with_best_match(
+            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ═══════════════ Phase 8 — Feature Normalization (additive, new) ════════════
+class NormalizeRequest(BaseModel):
+    uploaded_text: str
+
+
+@app.post("/framework/normalize")
+def framework_normalize(body: NormalizeRequest):
+    """Rewrite an uploaded feature to the framework's conventions: step wording
+    canonicalized to existing glue (so no Java is generated for steps the
+    framework can already run), tags recased/deduped, formatting standardized.
+    Deterministic; every rewrite is listed in `changes` for human review."""
     try:
-        from . import capture
-        facts["runtime_dom"] = capture.runtime_dom_for_prompt(txn)
-    except Exception:  # noqa: BLE001
-        pass
+        return feature_normalizer.normalize_feature(body.uploaded_text)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ═══════════════ Phase 8 — Feature Normalization (additive, new) ═══════════
+class NormalizeRequest(BaseModel):
+    uploaded_text: str
+    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+
+
+@app.post("/framework/normalize")
+def framework_normalize(body: NormalizeRequest):
+    """Rewrite the uploaded feature to match framework conventions (tag
+    casing, step wording, scenario naming, Examples headers) BEFORE any Java
+    generation. If existing_text is omitted, the best match is auto-found
+    (Phase 6). Not yet wired into /execute/upload."""
     try:
-        from . import framework_scanner
-        kb = framework_scanner.get_framework_knowledge()
-        locs = []
-        for pg in kb["pages"]:
-            if not module or pg["module"] == module:
-                locs += pg["locators"]
-        facts["page_locators"] = " ".join(locs)
-    except Exception:  # noqa: BLE001
-        pass
-    return facts
+        if body.existing_text is not None:
+            return feature_normalizer.normalize_feature(body.uploaded_text, body.existing_text)
+        return feature_normalizer.normalize_with_best_match(
+            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
-def evaluate(undefined_steps: list[str], txn: str | None, module: str | None) -> dict:
-    """Decide the gate outcome.
+# ═══════════════ Phase 9 — Intelligent Merge Engine (additive, new) ═════════
+class MergeRequest(BaseModel):
+    existing_text: str
+    normalized_text: str
 
-    Returns:
-      {
-        "policy": "todo" | "strict",
-        "ui_steps":        [steps that need a locator],
-        "resolvable":      bool,   # does the framework have ANY locator knowledge
-                                   # source to draw on for these screens?
-        "unresolved_steps":[ui steps with NO supporting locator source at all],
-        "blocked": bool,           # strict + unresolved -> generation must halt
-        "message": str,
-      }
-    """
-    policy = getattr(config, "LOCATOR_POLICY", "todo")
-    ui_steps = [s for s in undefined_steps if _needs_locator(s)]
 
-    if not ui_steps:
-        return {"policy": policy, "ui_steps": [], "resolvable": True,
-                "unresolved_steps": [], "blocked": False,
-                "message": "No new UI-interacting steps require locators."}
+@app.post("/framework/merge")
+def framework_merge(body: MergeRequest):
+    """Merge a normalized upload into an existing feature's text: keep
+    unchanged, replace modified, append new, never delete, formatting/comments
+    of untouched content preserved. Pass Phase 8's normalized_text here."""
+    return merge_engine.merge(body.existing_text, body.normalized_text)
 
-    sources = _resolution_sources(txn, module)
-    have_any_source = bool(sources["repository"].strip() or sources["runtime_dom"].strip()
-                           or sources["page_locators"].strip())
 
-    # Per UI step: is there ANY plausible locator source mentioning its key noun?
-    # (a lightweight signal — full element matching happens in generation).
-    unresolved = []
-    haystack = (sources["repository"] + " " + sources["runtime_dom"] + " "
-                + sources["page_locators"]).lower()
-    for step in ui_steps:
-        nouns = [w for w in re.findall(r"[a-zA-Z]{4,}", step.lower())
-                 if not _UI_VERBS.fullmatch(w)]
-        if not any(n in haystack for n in nouns):
-            unresolved.append(step)
+class PipelineRequest(BaseModel):
+    uploaded_text: str
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
 
-    # strict policy blocks whenever at least one UI step has no locator source
-    blocked = (policy == "strict") and bool(unresolved)
 
-    if blocked:
-        msg = (f"Locator discovery required: {len(unresolved)} new UI step(s) have no locator "
-               "in the repository, runtime capture, or existing page objects. Record these "
-               "screens (Locator Recorder) or run once with Capture Mode, then retry.")
-    elif unresolved:
-        msg = (f"{len(unresolved)} UI step(s) lack a known locator — generation will proceed "
-               "with '// TODO QA: verify locator' markers (policy: todo).")
-    else:
-        msg = "All new UI steps have a supporting locator source."
+@app.post("/framework/pipeline")
+def framework_pipeline(body: PipelineRequest):
+    """Convenience: Match (Phase 6) -> Normalize (Phase 8) -> Merge (Phase 9)
+    in one call, with full transparency into each step. Not yet wired into
+    /execute/upload."""
+    return merge_engine.merge_pipeline(body.uploaded_text, body.filename,
+                                       body.module_hint, body.txn_hint)
 
-    return {"policy": policy, "ui_steps": ui_steps, "resolvable": have_any_source,
-            "unresolved_steps": unresolved, "blocked": blocked, "message": msg}
+
+@app.get("/framework/archive/status")
+def archive_status():
+    """Browse the permanent archive (data/archive/<Txn>/<timestamp>/...) —
+    every file version ever replaced by an approved AI commit, never deleted."""
+    if not config.ARCHIVE_DIR.exists():
+        return {"count": 0, "entries": []}
+    entries = []
+    for txn_dir in sorted(config.ARCHIVE_DIR.iterdir()):
+        if not txn_dir.is_dir():
+            continue
+        for ts_dir in sorted(txn_dir.iterdir(), reverse=True):
+            if not ts_dir.is_dir():
+                continue
+            files = sorted(f.name for f in ts_dir.iterdir() if f.is_file())
+            entries.append({"txn": txn_dir.name, "timestamp": ts_dir.name,
+                           "files": files, "file_count": len(files)})
+    return {"count": len(entries), "entries": entries}
+
+
+# ═══════════════ Phase 3 — Knowledge Graph (additive, new) ══════════════════
+@app.post("/framework/graph/build")
+def graph_build():
+    """Scan the whole framework and build the Feature->Scenario->Step->
+    StepDefinition->PageMethod->Locator->TestData relationship graph."""
+    g = knowledge_graph.build_graph()
+    return g["stats"]
+
+
+@app.get("/framework/graph/stats")
+def graph_stats():
+    return knowledge_graph.get_graph()["stats"]
+
+
+@app.get("/framework/graph/trace")
+def graph_trace(step: str, keyword: str | None = None):
+    """'What does this step actually do?' — resolves a step sentence all the
+    way down to the page methods, locators, and test-data keys it touches."""
+    result = knowledge_graph.trace_step(step, keyword)
+    if result is None:
+        raise HTTPException(404, "No step definition matches this step text.")
+    return result
+
+
+@app.get("/framework/graph/impact")
+def graph_impact(locator: str):
+    """'What breaks if I change this locator?' — reverse lookup across every
+    page method, step definition, and scenario that touches it."""
+    return knowledge_graph.impact_of_locator(locator)
+
+
+@app.post("/execute/brd")
+async def execute_brd(file: UploadFile = File(...)):
+    """Upload a BRD (.pdf/.docx/.txt): AI drafts a feature file in the
+    framework's own conventions, then the draft enters the SAME Framework
+    Intelligence pipeline as a normal feature upload (match -> normalize ->
+    merge -> dry-run -> generate -> human review -> approve -> execute)."""
+    data = await file.read()
+    try:
+        brd_text = brd_processor.extract_text(file.filename, data)
+        result = brd_processor.brd_to_feature(brd_text, file.filename)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:          # Azure config/network errors, already user-facing
+        raise HTTPException(502, str(e))
+
+    feature_text = result["feature_text"]
+    stem = Path(file.filename).stem
+    dest = config.UPLOADS_DIR / f"{stem}.feature"
+    dest.write_text(feature_text, encoding="utf-8")
+
+    hit = indexer.lookup(result["txn"]) if result["txn"] else None
+    job = executor.start_job(str(dest), ai_ctx={
+        "uploaded_text": feature_text, "filename": dest.name,
+        "hit": hit, "module": result["module"] or (hit or {}).get("module"),
+    })
+    out = job.public()
+    out["generated_feature"] = feature_text
+    out["brd_conversion"] = {"txn": result["txn"], "module": result["module"]}
+    return out
+
+
+# ═══════════ Locator Intelligence — human-workflow recorder (additive) ══════
+class RecorderStart(BaseModel):
+    url: str | None = None
+
+
+@app.post("/recorder/start")
+def recorder_start(body: RecorderStart):
+    """Launch Edge with the event recorder injected. A human then performs the
+    workflow MANUALLY in that window; every click/typed field captures the
+    element's DOM identity (never the typed values)."""
+    try:
+        return recorder.start(body.url or getattr(config, "RECORDER_DEFAULT_URL", ""))
+    except RuntimeError as e:
+        raise HTTPException(409 if "already running" in str(e) else 502, str(e))
+
+
+@app.get("/recorder/status")
+def recorder_status():
+    return recorder.status()
+
+
+@app.post("/recorder/stop")
+def recorder_stop():
+    """Close the recording browser and return every captured element with its
+    prioritized locator candidates + suggested Java field name, for review."""
+    return recorder.stop()
+
+
+class RecorderSave(BaseModel):
+    entries: list[dict]
+
+
+@app.post("/recorder/save")
+def recorder_save(body: RecorderSave):
+    """Persist reviewed locators to the Locator Knowledge Repository. They are
+    injected into every future AI generation, replacing TODO guesses."""
+    added = recorder.save_entries(body.entries)
+    return {"added": added, "total": len(recorder.load_repository())}
+
+
+@app.post("/jobs/{job_id}/heal")
+def job_heal(job_id: str):
+    """Self-healing: use the captured DOM of the failed screen to repair
+    locators, then route through review/approve (auto under CI policy)."""
+    try:
+        return executor.heal_job(job_id).public()
+    except KeyError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/jobs/{job_id}/captures")
+def job_captures(job_id: str):
+    idx = runtime_capture.capture_dir_for(job_id) / "index.json"
+    if not idx.exists():
+        raise HTTPException(404, "No captures for this job.")
+    import json as _json
+    return {"checkpoints": _json.loads(idx.read_text())}
+
+
+# ═══════════ Capture Mode — runtime inspection ingestion (additive) ═════════
+class CaptureIn(BaseModel):
+    run_id: str | None = None
+    txn: str | None = None
+    checkpoint: str
+    html: str | None = None
+    screenshot_b64: str | None = None
+    metadata: dict | None = None
+
+
+@app.post("/capture/ingest")
+def capture_ingest(body: CaptureIn):
+    """Receive one runtime capture pushed by the Java framework when it reaches
+    a checkpoint screen. The framework navigates; this only stores what it
+    saw. Screenshot+HTML+metadata are persisted for AI reasoning."""
+    return capture.store_capture(body.run_id, body.txn, body.checkpoint,
+                                 body.html or "", body.screenshot_b64 or "", body.metadata)
+
+
+@app.get("/capture/list")
+def capture_list(run_id: str | None = None, txn: str | None = None):
+    return {"captures": capture.list_captures(run_id, txn)}
+
+
+@app.get("/txns")
+def search_txns(q: str = "", all: bool = False):
+    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
+    offer a scrollable, searchable dropdown of every feature."""
+    idx = indexer.get_index()
+    q = q.lower()
+    items = []
+    from pathlib import Path as _P
+    for k, v in idx.items():
+        if not v.get("feature"):
+            continue  # java-only entries can't be executed — keep them out of the picker
+        name = v.get("txn") or k
+        if q and q not in name.lower() and q not in (v.get("feature") or "").lower():
+            continue
+        items.append({"txn": name, "module": v.get("module") or "",
+                      "file": _P(v["feature"]).name})
+    items.sort(key=lambda x: int(re.sub(r"\D", "", x["txn"]) or 0))
+    if not all:
+        items = items[:50]
+    return {"count": len(items), "txns": items}
+
+
+# ───────────────────────── flow 1: run by txn number ────────────────────────
+@app.post("/execute/txn/{txn_no}")
+def execute_txn(txn_no: str, capture: bool = False, params: RunParams | None = None):
+    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
+    We locate the feature via the index, VERIFY the matching @tag exists inside
+    the feature file, then run with cucumber.filter.tags=<that exact tag> —
+    same effect as replacing the number in TestRunner's tags, but with no
+    Java edit and no recompile."""
+    hit = indexer.lookup(txn_no)
+    if not hit:
+        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
+    if not hit.get("feature"):
+        raise HTTPException(409,
+            f"{hit['txn']} has step-definition/page Java files but NO .feature file was found "
+            f"for this number anywhere under {config.FEATURES_DIR.name}. This transaction is "
+            f"not automatable until its feature file exists (check the filename's Txn number).")
+
+    # find the matching tag inside the feature file. Frameworks tag in several
+    # styles, so we accept (in priority order):
+    #   1. @Txn012000                              (exact, any casing)
+    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
+    #   3. @12000                                  (bare number, zero-padding ignored)
+    from pathlib import Path as _P
+    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+    tags_in_file = re.findall(r"@[\w]+", text)
+    digits = re.sub(r"\D", "", txn_no)
+
+    def _match_rank(t: str) -> int:
+        low = t.lower().lstrip("@")
+        if low == f"txn{digits}".lower():
+            return 1
+        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
+            return 2
+        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
+            return 3
+        return 99
+
+    tag = min(tags_in_file, key=_match_rank, default=None)
+    if tag is not None and _match_rank(tag) == 99:
+        tag = None
+    if not tag:
+        raise HTTPException(409,
+            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
+            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
+            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
+
+    job = executor.start_job(hit["feature"],
+                             run_params=params.model_dump() if params else None,
+                             tag_filter=tag)
+    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
+
+
+# ───────────────────── flow 2: run an uploaded feature ──────────────────────
+@app.post("/execute/upload")
+async def execute_upload(
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    ai: bool = False,
+    capture: bool = False,
+    url: str | None = Form(None),
+    maker_id: str | None = Form(None),
+    maker_password: str | None = Form(None),
+    checker_id: str | None = Form(None),
+    checker_password: str | None = Form(None),
+):
+    if not file.filename.endswith(".feature"):
+        raise HTTPException(400, "Please upload a .feature file.")
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    import re as _re
+    has_feature = _re.search(r"^\s*(?:@\S+\s*)*Feature:", text, _re.M)
+    has_scenario = _re.search(r"^\s*Scenario(?: Outline)?:", text, _re.M)
+    has_step = _re.search(r"^\s*(?:Given|When|Then|And|But)\s+\S", text, _re.M)
+    if not (has_feature and has_scenario and has_step):
+        missing = [n for ok, n in [(has_feature, "a 'Feature:' header"),
+                                    (has_scenario, "a 'Scenario:' line"),
+                                    (has_step, "Given/When/Then steps")] if not ok]
+        raise HTTPException(400,
+            f"'{file.filename}' is not valid Gherkin — it is missing {', '.join(missing)}. "
+            "Cucumber needs: Feature: <title>, then Scenario: <name>, then Given/When/Then steps. "
+            "If this is a solution/requirements document, a proper .feature must be written from it first.")
+
+    module = indexer.detect_module(text)
+    dest = config.UPLOADS_DIR / file.filename
+    dest.write_text(text, encoding="utf-8")
+
+    run_params = {
+        "url": url,
+        "maker_id": maker_id,
+        "maker_password": maker_password,
+        "checker_id": checker_id,
+        "checker_password": checker_password,
+    }
+    ai_ctx = None
+    if ai:
+        # identify the transaction from the filename first, then the content
+        m = indexer.TXN_RE.search(file.filename) or indexer.TXN_RE.search(text)
+        hit = indexer.lookup(m.group(1)) if m else None
+        ai_ctx = {"uploaded_text": text, "filename": file.filename,
+                  "hit": hit, "module": (hit or {}).get("module") or module}
+    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params,
+                             ai_ctx=ai_ctx)
+    closest = indexer.closest_feature(text, module)
+    return {
+        "module_detected": module,
+        "closest_existing_feature": closest,
+        "hint": "If the run reports undefined_steps, the framework has no Java glue "
+                "for those lines — reuse the closest_existing_feature's wording, "
+                "or generate new step definitions (phase 2).",
+        **job.public(),
+    }
+
+
+# ─────────────────────────── job status / logs ──────────────────────────────
+@app.get("/jobs/{job_id}/pending")
+def job_pending(job_id: str):
+    """The proposed changes for the in-browser review editor."""
+    job = executor.JOBS.get(job_id)
+    if not job or job.status != "review" or not job.pending:
+        raise HTTPException(404, "No changes awaiting review for this job.")
+    p = job.pending
+    hit = p.get("hit") or {}
+
+    old_feature_text = ""
+    if hit.get("feature"):
+        try:
+            old_feature_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            pass
+
+    old_files: dict[str, str | None] = {}
+    for rel in p["files"]:
+        f = config.JAVA_SRC_ROOT / rel
+        if f.exists():
+            try:
+                old_files[rel] = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                old_files[rel] = None
+        else:
+            old_files[rel] = None  # brand-new file — every line is "added"
+
+    return {
+        "feature_text": p["feature_text"], "files": p["files"], "meta": p["meta"],
+        "old_feature_text": old_feature_text, "old_files": old_files,
+        "match": {
+            "txn": hit.get("txn"), "module": hit.get("module"),
+            "confidence": p["meta"].get("matched_via_fallback_score"),  # None = direct/exact match
+            "is_new_feature": not bool(hit.get("feature")),
+        },
+    }
+
+
+class Approval(BaseModel):
+    feature_text: str | None = None
+    files: dict[str, str] | None = None
+
+
+@app.post("/jobs/{job_id}/approve")
+def job_approve(job_id: str, body: Approval):
+    try:
+        job = executor.approve_job(job_id, body.feature_text, body.files)
+    except KeyError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, "Your edited java does not compile:\n" + str(e))
+    return job.public()
+
+
+@app.post("/jobs/{job_id}/discard")
+def job_discard(job_id: str):
+    if not executor.discard_job(job_id):
+        raise HTTPException(409, "Job is not awaiting review.")
+    return {"job_id": job_id, "status": "discarded"}
+
+
+@app.post("/jobs/{job_id}/stop")
+def stop_job(job_id: str):
+    ok = executor.stop_job(job_id)
+    if not ok:
+        raise HTTPException(409, "Job is not running (or unknown id).")
+    return {"job_id": job_id, "status": "stopping"}
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = executor.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unknown job id.")
+    return job.public()
+
+
+@app.get("/jobs/{job_id}/logs")
+def job_logs(job_id: str, offset: int = 0):
+    chunk, new_offset = executor.read_log(job_id, offset)
+    job = executor.JOBS.get(job_id)
+    return {
+        "log": chunk,
+        "next_offset": new_offset,
+        "status": job.status if job else "unknown",
+    }
+
+
+# ───────────────────────── serve the frontend ───────────────────────────────
+# Must be mounted LAST so it doesn't shadow the API routes above.
+# Open http://localhost:8000 in a browser after starting uvicorn.
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
+if _FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
