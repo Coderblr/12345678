@@ -1,109 +1,153 @@
-#!/usr/bin/env python3
 """
-CI/CD client for the Txn Automation Console.
+Live Browser Capture Mode — Python side.
 
-Usage (from a pipeline step, orchestrator API already running):
-  python tools/ci_run.py --txn 1010
-  python tools/ci_run.py --feature path/to/Txn009093.feature --ai
-  python tools/ci_run.py --brd path/to/requirements.docx
-  python tools/ci_run.py --feature f.feature --ai --api http://ci-agent:8000
+The Java framework does ALL navigation (login, menus, opening transactions —
+the things it is already validated to do), then at configured checkpoints POSTs
+a runtime capture to this module: screenshot + HTML + metadata for the screen
+it just reached. We store each capture under
+data/runtime_capture/<run>/<txn>/<checkpoint>/ and expose it to the AI locator
+generator, so when new automation is generated the model reasons over the REAL
+DOM the framework actually saw — not a guess.
 
-Exit codes (for pipeline gating):
-  0 = run passed
-  1 = run failed (test failures)          -> fail the build
-  2 = paused for human review              -> mark build "review required"
-       (happens under AUTO_APPROVE_POLICY=never, or =no_todos when the AI
-        generated TODO locator markers it could not resolve)
-  3 = error (infra/config/AI failure)      -> fail the build, check logs
+Design rule from the spec, enforced here: the AI never navigates. This module
+only RECEIVES captures the framework pushes; it never drives a browser itself.
+(That is the recorder's separate, human-driven job.) This cleanly sidesteps
+the "navigate to the correct screen" problem — the framework already solved it.
 
-The full HTML-ready report JSON is written next to this script as
-ci_report_<job_id>.json for archiving as a build artifact.
+Screenshots are stored as-is (they are of the app UI, needed for vision later);
+HTML is stored but SANITIZED of obvious input values before persisting, so a
+captured page can't leak a typed account number or password to disk.
 """
-import argparse
+import base64
 import json
-import pathlib
-import sys
+import re
 import time
-import urllib.request
+from pathlib import Path
+
+from . import config
+
+# strip value="..." from inputs and text between form fields — best-effort PII guard
+_VALUE_ATTR = re.compile(r'(<input\b[^>]*?\bvalue=)"[^"]*"', re.I)
+_PWD_BLOCK = re.compile(r'(<input\b[^>]*\btype="password"[^>]*)value="[^"]*"', re.I)
 
 
-def _post(url, data=None, files=None):
-    if files:
-        import mimetypes
-        import uuid
-        boundary = uuid.uuid4().hex
-        name, path = files
-        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
-                f"filename=\"{pathlib.Path(path).name}\"\r\nContent-Type: "
-                f"{mimetypes.guess_type(path)[0] or 'application/octet-stream'}\r\n\r\n"
-                ).encode() + pathlib.Path(path).read_bytes() + f"\r\n--{boundary}--\r\n".encode()
-        req = urllib.request.Request(url, data=body, method="POST",
-                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    else:
-        req = urllib.request.Request(url, data=json.dumps(data or {}).encode(), method="POST",
-                                     headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read())
+def _sanitize_html(html: str) -> str:
+    html = _PWD_BLOCK.sub(r'\1value="[REDACTED]"', html)
+    html = _VALUE_ATTR.sub(r'\1"[REDACTED]"', html)
+    return html
 
 
-def _get(url):
-    with urllib.request.urlopen(url, timeout=60) as r:
-        return json.loads(r.read())
+def _canon_txn(txn: str | None) -> str:
+    if not txn:
+        return "unknown"
+    digits = re.sub(r"\D", "", str(txn))
+    return ("Txn" + digits.lstrip("0")) if digits else "unknown"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--api", default="http://127.0.0.1:8000")
-    ap.add_argument("--txn", help="run by transaction number")
-    ap.add_argument("--feature", help="path to a .feature file to upload")
-    ap.add_argument("--brd", help="path to a BRD (.pdf/.docx/.txt)")
-    ap.add_argument("--ai", action="store_true", help="Framework Intelligence mode for --feature")
-    ap.add_argument("--timeout-min", type=int, default=60)
-    args = ap.parse_args()
-
-    if args.txn:
-        job = _post(f"{args.api}/execute/txn/{args.txn if args.txn.lower().startswith('txn') else 'Txn' + args.txn}")
-    elif args.brd:
-        job = _post(f"{args.api}/execute/brd", files=("file", args.brd))
-    elif args.feature:
-        job = _post(f"{args.api}/execute/upload?ai={'true' if args.ai else 'false'}&dry_run=false",
-                    files=("file", args.feature))
-    else:
-        print("ERROR: one of --txn / --feature / --brd is required"); return 3
-
-    job_id = job["job_id"]
-    print(f"[ci] job {job_id} started")
-    deadline = time.time() + args.timeout_min * 60
-    last = ""
-    while time.time() < deadline:
-        j = _get(f"{args.api}/jobs/{job_id}")
-        if j["status"] != last:
-            print(f"[ci] status: {j['status']}")
-            last = j["status"]
-        if j["status"] in ("passed", "failed", "error", "review", "discarded", "locator_required"):
-            pathlib.Path(f"ci_report_{job_id}.json").write_text(json.dumps(j, indent=1))
-            s = j.get("summary", {})
-            print(f"[ci] scenarios: {s.get('scenarios_total', '?')} "
-                  f"passed: {s.get('scenarios_passed', '?')} failed: {s.get('scenarios_failed', '?')}")
-            if j["status"] == "passed":
-                return 0
-            if j["status"] == "locator_required":
-                print("[ci] LOCATOR DISCOVERY REQUIRED — new UI steps have no known locator. "
-                      "Record the screens (Locator Recorder) or run once with Capture Mode:")
-                for st in s.get("unresolved_steps", []):
-                    print(f"       - {st}")
-                return 4
-            if j["status"] == "review":
-                print("[ci] REVIEW REQUIRED — AI changes contain unresolved locators; "
-                      "a human must approve in the console before this can run.")
-                return 2
-            if j["status"] == "failed":
-                return 1
-            print(f"[ci] error: {s.get('error', 'unknown')}")
-            return 3
-        time.sleep(5)
-    print("[ci] TIMEOUT waiting for job"); return 3
+def _capture_root() -> Path:
+    d = config.DATA_DIR / "runtime_capture"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def store_capture(run_id: str, txn: str | None, checkpoint: str,
+                  html: str = "", screenshot_b64: str = "",
+                  metadata: dict | None = None) -> dict:
+    """Persist one runtime capture. Returns a small summary (never the full
+    payload). Called by the ingestion endpoint the Java framework POSTs to."""
+    run = re.sub(r"[^\w.-]", "_", run_id or time.strftime("%Y%m%d_%H%M%S"))
+    txn_c = _canon_txn(txn)
+    cp = re.sub(r"[^\w.-]", "_", checkpoint or "screen")
+    folder = _capture_root() / run / txn_c / cp
+    folder.mkdir(parents=True, exist_ok=True)
+
+    saved = {"html": False, "screenshot": False}
+    if html:
+        (folder / "page.html").write_text(_sanitize_html(html), encoding="utf-8", errors="ignore")
+        saved["html"] = True
+    if screenshot_b64:
+        try:
+            (folder / "screenshot.png").write_bytes(base64.b64decode(screenshot_b64))
+            saved["screenshot"] = True
+        except Exception:  # noqa: BLE001 — bad base64 shouldn't fail the whole capture
+            pass
+
+    meta = dict(metadata or {})
+    meta.update({"run_id": run, "txn": txn_c, "checkpoint": cp,
+                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "saved": saved})
+    (folder / "metadata.json").write_text(json.dumps(meta, indent=1))
+    return {"stored": True, "path": str(folder), "txn": txn_c,
+            "checkpoint": cp, "saved": saved}
+
+
+def list_captures(run_id: str | None = None, txn: str | None = None) -> list[dict]:
+    root = _capture_root()
+    out = []
+    for meta_file in root.rglob("metadata.json"):
+        try:
+            m = json.loads(meta_file.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if run_id and m.get("run_id") != run_id:
+            continue
+        if txn and _canon_txn(txn) != m.get("txn"):
+            continue
+        m["folder"] = str(meta_file.parent)
+        out.append(m)
+    return sorted(out, key=lambda m: m.get("timestamp", ""), reverse=True)
+
+
+def latest_capture_for(txn: str | None, checkpoint: str | None = None) -> dict | None:
+    """The most recent capture for a transaction (optionally a specific
+    checkpoint), used to feed the AI real runtime DOM when generating."""
+    caps = list_captures(txn=txn)
+    if checkpoint:
+        caps = [c for c in caps if c.get("checkpoint") == re.sub(r"[^\w.-]", "_", checkpoint)]
+    return caps[0] if caps else None
+
+
+def runtime_dom_for_prompt(txn: str | None, cap_chars: int = 6000) -> str:
+    """Trimmed runtime HTML for the latest capture of a txn, formatted for the
+    AI generation prompt. Empty string if nothing captured yet (generation
+    still proceeds, just without runtime context)."""
+    cap = latest_capture_for(txn)
+    if not cap:
+        return ""
+    html_file = Path(cap["folder"]) / "page.html"
+    if not html_file.exists():
+        return ""
+    html = html_file.read_text(encoding="utf-8", errors="ignore")
+    # keep the interactive skeleton: tags with id/name/placeholder/aria/type/text
+    interesting = re.findall(
+        r'<(?:input|button|select|textarea|a|td|th|label|option)\b[^>]*>',
+        html, re.I)
+    skeleton = "\n".join(interesting[:400])
+    body = skeleton or html
+    meta_line = (f'[runtime capture: screen="{cap.get("screen_name", cap.get("checkpoint"))}" '
+                 f'url="{cap.get("url", "?")}" title="{cap.get("title", "?")}"]')
+    return (meta_line + "\n" + body)[:cap_chars]
+
+
+# ─────────────── Screen Knowledge Repository (spec section) ───────────────────
+def _screen_repo_file() -> Path:
+    return config.DATA_DIR / "screen_repository.json"
+
+
+def load_screen_repository() -> list[dict]:
+    f = _screen_repo_file()
+    return json.loads(f.read_text()) if f.exists() else []
+
+
+def record_screen(entry: dict) -> int:
+    """After a successful run, record which screens were captured for which
+    txn so future generations can reuse them before any new capture."""
+    repo = load_screen_repository()
+    key = (entry.get("txn"), entry.get("screen_name"), entry.get("checkpoint"))
+    existing = {(e.get("txn"), e.get("screen_name"), e.get("checkpoint")) for e in repo}
+    if key in existing:
+        return 0
+    entry.setdefault("recorded_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+    repo.append(entry)
+    _screen_repo_file().write_text(json.dumps(repo, indent=1))
+    return 1
