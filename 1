@@ -1,119 +1,119 @@
 """
-BRD Processor — closes the one gap in the Normalization/Update Engine spec:
-accepting a BUSINESS REQUIREMENT DOCUMENT (.pdf / .docx / .txt) instead of a
-ready-made .feature file.
+Locator Discovery Gate (spec: locator resolution is MANDATORY before code
+generation; under strict policy, halt if locators can't be found).
 
-Flow: extract text -> Azure OpenAI drafts a feature file USING THE FRAMEWORK'S
-OWN CONVENTIONS (existing step sentences via the knowledge catalog, tag styles,
-a real feature as a style example) -> the draft then enters the EXISTING
-pipeline (match -> normalize -> merge -> dry-run -> generate -> review) exactly
-as if the user had uploaded that feature themselves. The BRD is never the
-source of truth; the framework is — the draft exists only to be normalized and
-merged like any other upload, with the same human review gate.
+This does NOT itself find element-level locators for arbitrary steps — that is
+what generation + the repository + capture do. Its job is the GATE decision:
+given the new/undefined steps that will need Java, decide whether the framework
+already has enough locator knowledge to implement them WITHOUT inventing
+guesses, and if not, stop and report exactly what's missing.
+
+Resolution sources checked, in order (all already built):
+  1. Locator repository (recorder-captured, human-verified locators)
+  2. Runtime capture DOM for this txn (Capture Mode)
+  3. Existing page-object locators for the txn's module (framework_scanner)
+
+A step is considered "UI-interacting" (needs a locator) if its wording implies
+a screen action — click/enter/select/verify-on-screen etc. Pure navigation or
+data-setup steps that reuse existing glue don't need new locators.
 """
-import io
 import re
-from pathlib import Path
 
 from . import config
 
+# words that imply the step touches a UI element (needs a locator)
+_UI_VERBS = re.compile(
+    r"\b(click|enter|select|type|choose|check|uncheck|tick|upload|input|fill|"
+    r"press|toggle|set|search|view|see|verify|validate|confirm|display|"
+    r"dropdown|button|field|screen|tile|checkbox|radio|link|tab|menu)\b", re.I)
 
-def extract_text(filename: str, data: bytes) -> str:
-    """Plain text from a BRD file. Raises ValueError with a user-facing
-    message for unsupported/broken files."""
-    suffix = Path(filename).suffix.lower()
-    if suffix == ".txt":
-        return data.decode("utf-8", errors="ignore")
-    if suffix == ".docx":
-        try:
-            import docx
-            document = docx.Document(io.BytesIO(data))
-            parts = [p.text for p in document.paragraphs]
-            for table in document.tables:
-                for row in table.rows:
-                    parts.append(" | ".join(c.text for c in row.cells))
-            return "\n".join(parts)
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(f"Could not read .docx file: {e}")
-    if suffix == ".pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(io.BytesIO(data))
-            return "\n".join((page.extract_text() or "") for page in reader.pages)
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(f"Could not read .pdf file: {e}")
-    if suffix == ".doc":
-        raise ValueError("Legacy .doc format is not supported - save the BRD as .docx or .pdf and re-upload.")
-    raise ValueError(f"Unsupported BRD type '{suffix}' - upload .pdf, .docx, or .txt (or a .feature file).")
+# steps that are clearly NOT new UI interactions (login/logout/navigation that
+# reuse existing common glue) — never block on these
+_NON_UI = re.compile(r"\b(logged in|log out|logout|logs? in|navigat|home screen|"
+                    r"is initiated|reviewing|parameters)\b", re.I)
 
 
-BRD_SYSTEM_PROMPT = """You are a senior QA automation engineer converting a business requirement
-document (BRD) into a Cucumber feature file for an existing enterprise banking automation framework.
-
-STRICT RULES:
-- Output ONLY the Gherkin feature file. No explanations, no markdown fences, no commentary.
-- Start with tag line(s), then 'Feature:', then scenarios with Given/When/Then/And steps.
-- REUSE the exact wording of EXISTING STEP SENTENCES provided below whenever the required behaviour
-  matches - identical wording means the framework already automates that step with zero new code.
-- Follow the tag conventions and formatting style of the EXAMPLE EXISTING FEATURE provided below.
-- Write concrete, executable scenarios with real values from the BRD (amounts, codes, transaction
-  numbers). Use Scenario Outline + Examples tables when the BRD lists multiple data variations.
-- If the BRD references a transaction number, include it in scenario wording the same way the
-  example feature does.
-- Do not invent UI details the BRD doesn't mention; keep steps at the business-action level."""
+def _needs_locator(step_text: str) -> bool:
+    if _NON_UI.search(step_text):
+        return False
+    return bool(_UI_VERBS.search(step_text))
 
 
-def brd_to_feature(brd_text: str, filename: str | None = None, log=lambda m: None) -> dict:
-    """Convert BRD text into a draft feature file written in the framework's
-    own conventions. Returns {feature_text, txn, module}."""
-    from . import framework_scanner, generator, indexer, knowledge
-
-    if len(brd_text.strip()) < 40:
-        raise ValueError("The BRD appears to be empty or unreadable after text extraction.")
-
-    txn_m = re.search(r"(?:Txn|transaction)\s*[#:]?\s*0*(\d{3,6})", brd_text, re.I)
-    txn = txn_m.group(1) if txn_m else None
-    module = indexer.detect_module(brd_text)
-
+def _resolution_sources(txn: str | None, module: str | None) -> dict:
+    """Everything the framework currently knows that could supply a locator."""
+    facts = {"repository": "", "runtime_dom": "", "page_locators": ""}
     try:
-        catalog = knowledge.step_catalog(module, cap=250)
-    except Exception:  # noqa: BLE001
-        catalog = "(knowledge base unavailable)"  
-
-    style_example = ""
-    try:
-        kb = framework_scanner.get_framework_knowledge()
-        candidates = [f for f in kb["features"] if not module or f["module"] == module] or kb["features"]
-        if candidates:
-            style_example = Path(candidates[0]["path"]).read_text(encoding="utf-8", errors="ignore")[:3000]
+        from . import recorder
+        facts["repository"] = recorder.repository_for_prompt()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from . import capture
+        facts["runtime_dom"] = capture.runtime_dom_for_prompt(txn)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from . import framework_scanner
+        kb = framework_scanner.get_framework_knowledge()
+        locs = []
+        for pg in kb["pages"]:
+            if not module or pg["module"] == module:
+                locs += pg["locators"]
+        facts["page_locators"] = " ".join(locs)
+    except Exception:  # noqa: BLE001
+        pass
+    return facts
 
-    log(">>> BRD: converting business requirements to a framework-convention feature draft...")
-    user = f"""## BUSINESS REQUIREMENT DOCUMENT{f' ({filename})' if filename else ''}:
-{brd_text[:12000]}
 
-## EXISTING STEP SENTENCES in the framework (reuse EXACT wording where behaviour matches):
-{catalog or '(none found)'}
+def evaluate(undefined_steps: list[str], txn: str | None, module: str | None) -> dict:
+    """Decide the gate outcome.
 
-## EXAMPLE EXISTING FEATURE (match this style, tags, and formatting):
-```gherkin
-{style_example or '(none available)'}
-```
+    Returns:
+      {
+        "policy": "todo" | "strict",
+        "ui_steps":        [steps that need a locator],
+        "resolvable":      bool,   # does the framework have ANY locator knowledge
+                                   # source to draw on for these screens?
+        "unresolved_steps":[ui steps with NO supporting locator source at all],
+        "blocked": bool,           # strict + unresolved -> generation must halt
+        "message": str,
+      }
+    """
+    policy = getattr(config, "LOCATOR_POLICY", "todo")
+    ui_steps = [s for s in undefined_steps if _needs_locator(s)]
 
-Produce the feature file now."""
-    reply = generator._azure_chat([{"role": "system", "content": BRD_SYSTEM_PROMPT},
-                                   {"role": "user", "content": user}])
+    if not ui_steps:
+        return {"policy": policy, "ui_steps": [], "resolvable": True,
+                "unresolved_steps": [], "blocked": False,
+                "message": "No new UI-interacting steps require locators."}
 
-    text = reply.strip()
-    text = re.sub(r"^```(?:gherkin)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text).strip() + "\n"
+    sources = _resolution_sources(txn, module)
+    have_any_source = bool(sources["repository"].strip() or sources["runtime_dom"].strip()
+                           or sources["page_locators"].strip())
 
-    parsed = framework_scanner.parse_feature_text(text)
-    if not parsed or not parsed["scenarios"]:
-        raise ValueError("The AI's BRD conversion did not produce valid Gherkin - "
-                         "the BRD may be too vague to derive concrete scenarios. "
-                         "Add explicit flows/validations to the BRD, or write the feature manually.")
-    log(f">>> BRD: draft feature ready - {len(parsed['scenarios'])} scenario(s), "
-        f"txn hint: {txn or 'none'}, module: {module or 'undetected'}.")
-    return {"feature_text": text, "txn": txn, "module": module}
+    # Per UI step: is there ANY plausible locator source mentioning its key noun?
+    # (a lightweight signal — full element matching happens in generation).
+    unresolved = []
+    haystack = (sources["repository"] + " " + sources["runtime_dom"] + " "
+                + sources["page_locators"]).lower()
+    for step in ui_steps:
+        nouns = [w for w in re.findall(r"[a-zA-Z]{4,}", step.lower())
+                 if not _UI_VERBS.fullmatch(w)]
+        if not any(n in haystack for n in nouns):
+            unresolved.append(step)
+
+    # strict policy blocks whenever at least one UI step has no locator source
+    blocked = (policy == "strict") and bool(unresolved)
+
+    if blocked:
+        msg = (f"Locator discovery required: {len(unresolved)} new UI step(s) have no locator "
+               "in the repository, runtime capture, or existing page objects. Record these "
+               "screens (Locator Recorder) or run once with Capture Mode, then retry.")
+    elif unresolved:
+        msg = (f"{len(unresolved)} UI step(s) lack a known locator — generation will proceed "
+               "with '// TODO QA: verify locator' markers (policy: todo).")
+    else:
+        msg = "All new UI steps have a supporting locator source."
+
+    return {"policy": policy, "ui_steps": ui_steps, "resolvable": have_any_source,
+            "unresolved_steps": unresolved, "blocked": blocked, "message": msg}
